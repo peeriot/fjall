@@ -547,6 +547,11 @@ impl WriteTransaction {
 
         let mut state = self.oracle.write_serialize_lock()?;
 
+        // NOTE: Again under the lock: a 2PC batch may have failed while this waited
+        if db.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+
         // 1. Duplicate check, against pending reservations and durable rows
         //
         // NOTE: The rows are read at SeqNo::MAX: a snapshot could predate a resolution

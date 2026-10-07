@@ -236,6 +236,108 @@ fn poisoned_database_creates_nothing() -> crate::Result<()> {
     Ok(())
 }
 
+/// Number of the `futex` system call.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const FUTEX_SYSCALL: &str = "202";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const FUTEX_SYSCALL: &str = "98";
+
+/// The `/proc` directory of the calling thread.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn thread_proc_dir() -> std::io::Result<std::path::PathBuf> {
+    Ok(std::path::Path::new("/proc").join(std::fs::read_link("/proc/thread-self")?))
+}
+
+/// Waits until the thread with the `/proc` directory `dir` has slept in a futex
+/// wait (blocked on a lock) for several polls in a row.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn wait_until_blocked(dir: &std::path::Path) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut streak = 0;
+    while streak < 5 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{dir:?} never blocked"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let stat = std::fs::read_to_string(dir.join("stat"))?;
+        let syscall = std::fs::read_to_string(dir.join("syscall"))?;
+        // NOTE: The state follows the parenthesized thread name
+        let sleeping = stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('S'));
+        let in_futex = syscall.split_whitespace().next() == Some(FUTEX_SYSCALL);
+        streak = if sleeping && in_futex { streak + 1 } else { 0 };
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn poison_while_waiting_for_the_oracle_lock_is_not_missed() -> crate::Result<()> {
+    // §4 poisoning discipline: the flag is checked again under the oracle lock
+    let folder = tempfile::tempdir()?;
+    let db = open(&folder)?;
+    let _a = keyspace(&db, "a")?;
+    let read_only = db.write_tx()?;
+
+    let guard = db.oracle.write_serialize_lock()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawn = |call: Box<dyn FnOnce() -> crate::Result<bool> + Send>| {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            sender.send(thread_proc_dir()).expect("receiver alive");
+            call()
+        })
+    };
+    let rollback = {
+        let db = db.clone();
+        spawn(Box::new(move || {
+            db.rollback_prepared("unknown")
+                .map(|r| r == Resolution::NoOp)
+        }))
+    };
+    let commit = {
+        let db = db.clone();
+        spawn(Box::new(move || {
+            db.commit_prepared("unknown").map(|r| r == Resolution::NoOp)
+        }))
+    };
+    let prepare = spawn(Box::new(move || {
+        read_only
+            .prepare("ro")
+            .map(|r| matches!(r, Ok(PrepareOutcome::ReadOnly)))
+    }));
+    for _ in 0..3 {
+        wait_until_blocked(&receiver.recv().expect("sent")?)?;
+    }
+
+    db.inner().is_poisoned.poison(); // as by a 2PC batch that failed meanwhile
+    drop(guard);
+
+    for (name, call) in [
+        ("rollback_prepared", rollback),
+        ("commit_prepared", commit),
+        ("read-only prepare", prepare),
+    ] {
+        let outcome = call.join().expect("no panic");
+        assert!(
+            matches!(outcome, Err(crate::Error::Poisoned)),
+            "{name}: {outcome:?}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn undecodable_rows_are_unrecoverable() -> crate::Result<()> {
     let cases: [(Slice, Slice); 3] = [

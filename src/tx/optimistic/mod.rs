@@ -132,6 +132,11 @@ impl OptimisticTxDatabase {
 
         let mut state = self.oracle.write_serialize_lock()?;
 
+        // NOTE: Again under the lock: a 2PC batch may have failed while this waited
+        if self.inner.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+
         let Some((txn, rows)) = self.rows_to_resolve(xid)? else {
             // NOTE: Defensive; a reservation never outlives its rows
             state.reservations.remove(xid);
@@ -219,6 +224,11 @@ impl OptimisticTxDatabase {
         }
 
         let mut state = self.oracle.write_serialize_lock()?;
+
+        // NOTE: Again under the lock: a 2PC batch may have failed while this waited
+        if self.inner.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
 
         let Some((txn, rows)) = self.rows_to_resolve(xid)? else {
             // NOTE: Defensive; a reservation never outlives its rows
