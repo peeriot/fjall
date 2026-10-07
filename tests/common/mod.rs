@@ -8,3 +8,16 @@ pub fn keyspace_dirs(db_folder: &std::path::Path) -> std::io::Result<Vec<String>
     names.sort();
     Ok(names)
 }
+
+/// Prepares a transaction that inserts `key` → `value` into `keyspace` under `xid`.
+pub fn prepare_put(
+    db: &fjall::OptimisticTxDatabase,
+    keyspace: &fjall::OptimisticTxKeyspace,
+    xid: &str,
+    key: &str,
+    value: &str,
+) -> fjall::Result<Result<fjall::PrepareOutcome, fjall::Conflict>> {
+    let mut tx = db.write_tx()?;
+    tx.insert(keyspace, key, value);
+    tx.prepare(xid)
+}

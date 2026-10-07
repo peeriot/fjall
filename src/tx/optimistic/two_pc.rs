@@ -13,9 +13,21 @@
 
 #![cfg_attr(not(test), allow(dead_code, reason = "wired up by Tasks 5-8"))]
 
-use crate::keyspace::InternalKeyspaceId;
+use crate::{keyspace::InternalKeyspaceId, Database, Keyspace};
 use byteorder::{ReadBytesExt, WriteBytesExt, BE};
-use lsm_tree::{Slice, ValueType};
+use lsm_tree::{AbstractTree, Guard, SeqNo, Slice, ValueType};
+
+/// Outcome of a successful prepare vote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrepareOutcome {
+    /// Write-set durably recorded; resolve it with `commit_prepared` or `rollback_prepared`.
+    Prepared,
+
+    /// Empty write-set: validated but nothing recorded (XA read-only optimization).
+    ///
+    /// Requires no phase 2; it will never be reported as pending.
+    ReadOnly,
+}
 
 /// Kind of a prepared write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -217,6 +229,101 @@ pub fn check_item_size(
     }
 
     Ok(())
+}
+
+/// One decoded `__fjall_txn` row.
+pub struct PreparedRow {
+    /// The stored composite key, tombstoned at resolution
+    #[allow(dead_code, reason = "used by a later commit")]
+    pub row_key: Slice,
+
+    /// The prepared transaction's xid
+    pub xid: Slice,
+
+    /// Id of the keyspace the write targets
+    pub keyspace_id: InternalKeyspaceId,
+
+    /// The written key in the target keyspace
+    pub user_key: Slice,
+
+    /// The kind of write
+    pub kind: PreparedItemKind,
+
+    /// The written value; empty for deletions
+    pub user_value: Slice,
+}
+
+/// Reads every row under `prefix` (all rows if `prefix` is empty) at `seqno`, in key order.
+///
+/// # Errors
+///
+/// Returns `Error::Unrecoverable` if a row cannot be decoded, or an error if an I/O
+/// error occurred.
+pub fn read_rows(txn: &Keyspace, prefix: &[u8], seqno: SeqNo) -> crate::Result<Vec<PreparedRow>> {
+    let iter = if prefix.is_empty() {
+        txn.tree.iter(seqno, None)
+    } else {
+        txn.tree.prefix(prefix, seqno, None)
+    };
+
+    let mut rows = Vec::new();
+
+    for guard in iter {
+        let (row_key, value) = guard.into_inner()?;
+
+        let decoded = decode_row_key(&row_key)
+            .and_then(|key| decode_row_value(&value).map(|value| (key, value)));
+
+        let Ok((key, (kind, user_value))) = decoded else {
+            log::error!(
+                "Undecodable row in the prepared transactions keyspace (key={row_key:?}): the keyspace is corrupt",
+            );
+            return Err(crate::Error::Unrecoverable);
+        };
+
+        rows.push(PreparedRow {
+            row_key,
+            xid: key.xid,
+            keyspace_id: key.keyspace_id,
+            user_key: key.user_key,
+            kind,
+            user_value,
+        });
+    }
+
+    Ok(rows)
+}
+
+/// Returns `true` if any row of `xid` exists, read at `SeqNo::MAX`. Decodes nothing.
+///
+/// # Errors
+///
+/// Returns an error if an I/O error occurred.
+pub fn has_rows(txn: &Keyspace, xid: &[u8]) -> crate::Result<bool> {
+    let Some(prefix) = xid_prefix(xid) else {
+        return Ok(false);
+    };
+
+    match txn.tree.prefix(prefix, SeqNo::MAX, None).next() {
+        Some(guard) => {
+            guard.key()?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Maps the error of a failed 2PC batch commit to `Error::Poisoned` if the database
+/// is now poisoned; otherwise returns `error` unchanged.
+///
+/// `Poisoned` is the only error after which a prepared xid may resurface, so
+/// every failure that poisoned the database must be reported as such.
+pub fn normalize_batch_error(db: &Database, error: crate::Error) -> crate::Error {
+    if db.is_poisoned() {
+        crate::Error::Poisoned
+    } else {
+        error
+    }
 }
 
 #[cfg(test)]

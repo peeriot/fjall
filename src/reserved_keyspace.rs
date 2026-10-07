@@ -23,7 +23,6 @@ impl Database {
     /// Returns `Error::Unrecoverable` if the meta keyspace still maps the reserved
     /// name but no keyspace handle exists (its directory was lost), or an error if
     /// the meta keyspace could not be read.
-    #[allow(dead_code, reason = "called by WriteTransaction::prepare in a later commit")]
     pub(crate) fn reserved_keyspace(&self) -> crate::Result<Option<Keyspace>> {
         // NOTE: The lost-keyspace check runs under the same lock as the map lookup,
         // so it cannot observe the mapping of a creation that the lookup missed
@@ -50,7 +49,6 @@ impl Database {
     /// Returns `Error::Unrecoverable` if the meta keyspace still maps the reserved
     /// name but no keyspace handle exists (nothing is created then), or an error if
     /// an I/O error occurred.
-    #[allow(dead_code, reason = "called by WriteTransaction::prepare in a later commit")]
     pub(crate) fn reserved_keyspace_or_create(&self) -> crate::Result<Keyspace> {
         #[expect(clippy::expect_used)]
         let keyspaces = self.supervisor.keyspaces.write().expect("lock is poisoned");

@@ -308,6 +308,38 @@ impl BaseTransaction {
         self.seqno += 1;
     }
 
+    /// Returns the write-set: the latest write per (keyspace, user key).
+    ///
+    /// Within a keyspace, the items are in key order.
+    pub(crate) fn write_set(&self) -> Vec<Item> {
+        let mut items = Vec::new();
+
+        for (keyspace, memtable) in &self.memtables {
+            let mut prev_key: Option<UserKey> = None;
+
+            // NOTE: The memtable yields the versions of a key newest first,
+            // so the first item per user key is its latest write
+            for item in memtable.iter() {
+                if let Some(prev_key) = &prev_key {
+                    if item.key.user_key == prev_key {
+                        continue;
+                    }
+                }
+
+                items.push(Item::new(
+                    keyspace.clone(),
+                    item.key.user_key.clone(),
+                    item.value.clone(),
+                    item.key.value_type,
+                ));
+
+                prev_key = Some(item.key.user_key.clone());
+            }
+        }
+
+        items
+    }
+
     /// Commits the transaction.
     ///
     /// # Errors
@@ -319,32 +351,13 @@ impl BaseTransaction {
             return Ok(());
         }
 
+        let write_set = self.write_set();
+
         // TODO: instead of using batch, write batch::commit as a generic function that takes
         // a impl Iterator<BatchItem>
         // that way, we don't have to move the memtable(s) into the batch first to commit
         let mut batch = OwnedWriteBatch::new(self.db).durability(self.durability);
-
-        for (keyspace, memtable) in self.memtables {
-            let mut prev_key: Option<UserKey> = None;
-
-            for item in memtable.iter() {
-                if let Some(prev_key) = &prev_key {
-                    if item.key.user_key == prev_key {
-                        continue;
-                    }
-                }
-
-                batch.data.push(Item::new(
-                    keyspace.clone(),
-                    item.key.user_key.clone(),
-                    item.value.clone(),
-                    item.key.value_type,
-                ));
-
-                prev_key = Some(item.key.user_key.clone());
-            }
-        }
-
+        batch.data = write_set;
         batch.commit()?;
 
         Ok(())

@@ -3,17 +3,22 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    batch::{item::Item, WriteBatch},
     snapshot_nonce::SnapshotNonce,
     tx::{
         optimistic::{
             conflict_manager::ConflictManager,
             oracle::{CommitOutcome, ConflictSource, Oracle},
+            two_pc::{
+                check_item_size, encode_row_key, encode_row_value, has_rows, normalize_batch_error,
+                PrepareOutcome, PreparedItemKind, MAX_XID_LEN,
+            },
         },
         write_tx::BaseTransaction,
     },
     Database, Guard, Iter, Keyspace, PersistMode, Readable,
 };
-use lsm_tree::{Slice, UserKey, UserValue};
+use lsm_tree::{Slice, UserKey, UserValue, ValueType};
 use std::{
     fmt,
     ops::{Bound, RangeBounds, RangeFull},
@@ -467,6 +472,132 @@ impl WriteTransaction {
             CommitOutcome::Conflicted => Ok(Err(ConflictSource::Ssi)),
             CommitOutcome::ReservationConflicted => Ok(Err(ConflictSource::Reservation)),
         }
+    }
+
+    /// Phase 1 of a two-phase commit: validates this transaction (its reads, plus
+    /// the write-sets of pending prepares), then durably records its write-set under
+    /// `xid` WITHOUT applying it.
+    ///
+    /// - `Ok(Ok(PrepareOutcome))`: vote YES (see [`PrepareOutcome`])
+    /// - `Ok(Err(Conflict))`: the transaction conflicted; nothing is durable, and it
+    ///   never becomes in-doubt
+    ///
+    /// While the prepare is pending, the keys of its write-set are frozen: any other
+    /// transaction that reads or writes one of them conflicts.
+    ///
+    /// The transaction is consumed either way.
+    ///
+    /// The first non-empty prepare in a database's lifetime also creates the
+    /// hidden keyspace that holds prepared write-sets; it is slower than
+    /// later ones by one keyspace creation.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::XidInUse`: `xid` is currently prepared and unresolved
+    /// - `Error::PreparedItemTooLarge`: a write-set item exceeds the size limits of a
+    ///   prepared row (key longer than 65,535 − 10 − xid length bytes, or value longer
+    ///   than `u32::MAX` − 2 bytes); nothing was written
+    /// - `Error::Poisoned`: persisting failed; the prepare MAY nonetheless be on disk.
+    ///   This is the ONLY error after which the xid may resurface: after the mandated
+    ///   restart it may be reported as pending and must then be resolved.
+    /// - `Error::Unrecoverable`: the keyspace of prepared write-sets was lost
+    /// - any other error: nothing of this transaction was persisted, guaranteed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `xid` is empty or longer than 255 bytes.
+    pub fn prepare(self, xid: impl Into<Slice>) -> crate::Result<Result<PrepareOutcome, Conflict>> {
+        let xid: Slice = xid.into();
+
+        assert!(
+            !xid.is_empty() && xid.len() <= MAX_XID_LEN,
+            "xid must be 1 to 255 bytes long"
+        );
+
+        let db = &self.inner.db;
+
+        // 0a. Poison check, before any early return
+        if db.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+
+        // NOTE: Everything that can panic runs before the oracle lock is taken:
+        // a panic under that lock would poison it for the life of the process
+        let write_set: Vec<(Item, PreparedItemKind)> = self
+            .inner
+            .write_set()
+            .into_iter()
+            .map(|item| {
+                let kind = PreparedItemKind::from_value_type(item.value_type);
+                (item, kind)
+            })
+            .collect();
+
+        // 0b. Size checks; they keep the asserts of the row items unreachable
+        for (item, _) in &write_set {
+            check_item_size(xid.len(), item.key.len(), item.value.len())?;
+        }
+
+        // 0c. A read-only prepare never creates the reserved keyspace
+        let txn = if write_set.is_empty() {
+            db.reserved_keyspace()?
+        } else {
+            Some(db.reserved_keyspace_or_create()?)
+        };
+
+        let mut state = self.oracle.write_serialize_lock()?;
+
+        // 1. Duplicate check, against pending reservations and durable rows
+        //
+        // NOTE: The rows are read at SeqNo::MAX: a snapshot could predate a resolution
+        // that just completed under this lock and still see its rows
+        if state.reservations.contains_key(&*xid) {
+            return Err(crate::Error::XidInUse);
+        }
+        if let Some(txn) = &txn {
+            if has_rows(txn, &xid)? {
+                return Err(crate::Error::XidInUse);
+            }
+        }
+
+        // 2. Validate, even for an empty write-set (unlike commit)
+        if state
+            .find_conflict(self.inner.nonce.instant, &self.cm)
+            .is_some()
+        {
+            return Ok(Err(Conflict));
+        }
+
+        // 3. Read-only: no rows, no reservation, the xid is not remembered
+        let Some(txn) = txn.filter(|_| !write_set.is_empty()) else {
+            return Ok(Ok(PrepareOutcome::ReadOnly));
+        };
+
+        // 4. Persist the deduplicated write-set as rows, in one batch, forcing an fsync
+        let reservation = ConflictManager::default();
+
+        let mut batch = WriteBatch::new(db.clone()).durability(Some(PersistMode::SyncAll));
+        batch.data.reserve_exact(write_set.len());
+
+        for (item, kind) in write_set {
+            batch.data.push(Item::new(
+                txn.clone(),
+                encode_row_key(&xid, item.keyspace.id, &item.key),
+                encode_row_value(kind, &item.value),
+                ValueType::Value,
+            ));
+
+            // NOTE: The reservation is built from the persisted items, not from the
+            // conflict keys, which can hold keys that were not written
+            reservation.mark_conflict(item.keyspace.id, item.key);
+        }
+
+        batch.commit().map_err(|e| normalize_batch_error(db, e))?;
+
+        // 5. Freeze the write-set until the xid is resolved
+        state.reservations.insert(xid, reservation);
+
+        Ok(Ok(PrepareOutcome::Prepared))
     }
 
     /// More explicit alternative to dropping the transaction

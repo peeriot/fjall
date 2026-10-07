@@ -1,7 +1,7 @@
 mod common;
 
 use common::keyspace_dirs;
-use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace};
+use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PrepareOutcome};
 use test_log::test;
 
 fn sorted_names(db: &OptimisticTxDatabase) -> Vec<String> {
@@ -32,6 +32,10 @@ fn exercise(
     a.update_fetch("k", |_| Some("u".into()))?;
     a.take("k")?;
 
+    assert!(matches!(
+        db.write_tx()?.prepare("ro")?,
+        Ok(PrepareOutcome::ReadOnly)
+    ));
     Ok(())
 }
 
@@ -74,4 +78,34 @@ fn reserved_keyspace_name_panics() {
     let folder = tempfile::tempdir().expect("tempdir");
     let db = OptimisticTxDatabase::builder(&folder).open().expect("open");
     let _ = db.keyspace("__fjall_txn", KeyspaceCreateOptions::default);
+}
+
+#[test]
+fn first_non_empty_prepare_creates_a_hidden_keyspace() -> fjall::Result<()> {
+    let folder = tempfile::tempdir()?;
+    {
+        let db = OptimisticTxDatabase::builder(&folder).open()?;
+        let a = db.keyspace("a", KeyspaceCreateOptions::default)?;
+        assert!(matches!(
+            common::prepare_put(&db, &a, "x", "k", "v")?,
+            Ok(PrepareOutcome::Prepared)
+        ));
+        assert_eq!(vec!["0", "1", "2"], keyspace_dirs(folder.path())?);
+        assert_eq!(1, db.keyspace_count());
+        assert_eq!(vec!["a"], sorted_names(&db));
+        assert!(!db.keyspace_exists("__fjall_txn"));
+    }
+
+    let db = OptimisticTxDatabase::builder(&folder).open()?;
+    assert_eq!(vec!["0", "1", "2"], keyspace_dirs(folder.path())?);
+    assert_eq!(1, db.keyspace_count());
+    assert_eq!(vec!["a"], sorted_names(&db));
+    assert!(!db.keyspace_exists("__fjall_txn"));
+    assert_eq!(
+        3,
+        db.keyspace("b", KeyspaceCreateOptions::default)?
+            .inner()
+            .id()
+    );
+    Ok(())
 }
