@@ -153,7 +153,7 @@ pub use {
     guard::Guard,
     iter::Iter,
     journal::{error::RecoveryError as JournalRecoveryError, writer::PersistMode},
-    keyspace::{options::CreateOptions as KeyspaceCreateOptions, Keyspace},
+    keyspace::{options::CreateOptions as KeyspaceCreateOptions, InternalKeyspaceId, Keyspace},
     readable::Readable,
     snapshot::Snapshot,
     version::FormatVersion,
@@ -165,9 +165,9 @@ pub use tx::single_writer::{
 };
 
 pub use tx::optimistic::{
-    Conflict, OptimisticTxDatabase, OptimisticTxKeyspace, PrepareOutcome, PreparedItemKind,
-    Resolution, UntrackedWriteTransaction as OptimisticUntrackedWriteTx,
-    WriteTransaction as OptimisticWriteTx,
+    Conflict, OptimisticTxDatabase, OptimisticTxKeyspace, PrepareOutcome, PreparedItem,
+    PreparedItemKind, PreparedTxInfo, Resolution,
+    UntrackedWriteTransaction as OptimisticUntrackedWriteTx, WriteTransaction as OptimisticWriteTx,
 };
 
 #[doc(hidden)]

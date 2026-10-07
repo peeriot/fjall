@@ -37,6 +37,14 @@ fn lost_reserved_keyspace_fails_every_2pc_call() -> fjall::Result<()> {
         db.rollback_prepared("x"),
         Err(fjall::Error::Unrecoverable)
     ));
+    assert!(matches!(
+        db.pending_prepared(),
+        Err(fjall::Error::Unrecoverable)
+    ));
+    assert!(matches!(
+        db.prepared_items("x"),
+        Err(fjall::Error::Unrecoverable)
+    ));
 
     assert_eq!(vec!["0", "1"], keyspace_dirs(folder.path())?);
     let mut tx = db.write_tx()?;

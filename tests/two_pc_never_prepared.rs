@@ -40,6 +40,8 @@ fn exercise(
     ));
     assert_eq!(Resolution::NoOp, db.commit_prepared("ro")?);
     assert_eq!(Resolution::NoOp, db.rollback_prepared("nope")?);
+    assert!(db.pending_prepared()?.is_empty());
+    assert!(db.prepared_items("ro")?.is_empty());
     Ok(())
 }
 

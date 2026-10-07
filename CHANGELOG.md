@@ -1,5 +1,6 @@
 # Unreleased
 
+- [feat] Two-phase commit for `OptimisticTxDatabase`: `WriteTransaction::prepare`, `commit_prepared`, `rollback_prepared`, `pending_prepared`, `prepared_items`; keyspace names starting with `__fjall` are reserved
 - [api] `OptimisticTxKeyspace::insert`, `remove` and `remove_weak` return `Error::PreparedConflict` instead of panicking when a pending prepare froze the key
 - [api] `OptimisticTxKeyspace::fetch_update`, `update_fetch` and `take` return `Error::PreparedConflict` instead of retrying forever when a pending prepare froze the key
 

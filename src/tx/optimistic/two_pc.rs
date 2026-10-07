@@ -13,7 +13,11 @@
 
 #![cfg_attr(not(test), allow(dead_code, reason = "wired up by Tasks 5-8"))]
 
-use crate::{keyspace::InternalKeyspaceId, worker_pool::WorkerMessage, Database, Keyspace};
+use crate::{
+    keyspace::{InternalKeyspaceId, KeyspaceKey},
+    worker_pool::WorkerMessage,
+    Database, Keyspace,
+};
 use byteorder::{ReadBytesExt, WriteBytesExt, BE};
 use lsm_tree::{AbstractTree, Guard, SeqNo, Slice, ValueType};
 
@@ -44,6 +48,41 @@ pub enum Resolution {
     /// Safe on retries; a `NoOp` on the FIRST resolution attempt of a branch that
     /// voted `Prepared` indicates lost prepared state or out-of-band interference.
     NoOp,
+}
+
+/// An in-doubt prepared transaction, as reported by `pending_prepared`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedTxInfo {
+    /// Application-supplied transaction id
+    pub xid: Slice,
+
+    /// Number of items in the write-set
+    pub item_count: usize,
+
+    /// Names of the target keyspaces that exist, sorted and deduplicated
+    pub keyspaces: Vec<KeyspaceKey>,
+
+    /// Internal ids of the target keyspaces that no longer exist (deleted since the
+    /// prepare), sorted and deduplicated
+    ///
+    /// `commit_prepared` drops the items that target them.
+    pub missing_keyspace_ids: Vec<InternalKeyspaceId>,
+}
+
+/// One item of the durable write-set of an in-doubt prepared transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedItem {
+    /// Name of the target keyspace; `None` if it was deleted
+    pub keyspace: Option<KeyspaceKey>,
+
+    /// Internal id of the target keyspace
+    pub keyspace_id: InternalKeyspaceId,
+
+    /// The written key
+    pub key: Slice,
+
+    /// The kind of write
+    pub kind: PreparedItemKind,
 }
 
 /// Kind of a prepared write.

@@ -210,6 +210,11 @@ fn poisoned_database_refuses_every_2pc_call() -> crate::Result<()> {
         Err(crate::Error::Poisoned)
     ));
     assert_eq!(None, a.get("k")?);
+    assert!(matches!(db.pending_prepared(), Err(crate::Error::Poisoned)));
+    assert!(matches!(
+        db.prepared_items("x"),
+        Err(crate::Error::Poisoned)
+    ));
     Ok(())
 }
 
@@ -250,6 +255,14 @@ fn undecodable_rows_are_unrecoverable() -> crate::Result<()> {
         ));
         assert!(matches!(
             db.rollback_prepared("x"),
+            Err(crate::Error::Unrecoverable)
+        ));
+        assert!(matches!(
+            db.pending_prepared(),
+            Err(crate::Error::Unrecoverable)
+        ));
+        assert!(matches!(
+            db.prepared_items("x"),
             Err(crate::Error::Unrecoverable)
         ));
         assert_eq!(1, txn.len()?, "the row was neither skipped nor removed");

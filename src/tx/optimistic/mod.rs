@@ -33,7 +33,7 @@ use std::{
 };
 
 pub use keyspace::OptimisticTxKeyspace;
-pub use two_pc::{PrepareOutcome, PreparedItemKind, Resolution};
+pub use two_pc::{PrepareOutcome, PreparedItem, PreparedItemKind, PreparedTxInfo, Resolution};
 pub use write_tx::{Conflict, UntrackedWriteTransaction, WriteTransaction};
 
 /// Transactional database
@@ -245,6 +245,117 @@ impl OptimisticTxDatabase {
         request_compaction(&txn);
 
         Ok(Resolution::Applied { dropped_items: 0 })
+    }
+
+    /// Enumerates the in-doubt prepared transactions, ordered by xid length, then xid.
+    ///
+    /// MUST be called after `open()`, and every reported xid resolved before writes
+    /// are admitted: after a restart, a prepared write-set is no longer frozen, and a
+    /// write that commits before its `commit_prepared` is silently overwritten by it.
+    ///
+    /// Exact: every xid is reported with its complete write-set or not at all. Reads
+    /// at a snapshot instant and takes no lock. Empty on a database that never
+    /// prepared.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::Poisoned`: fatal; restart the process, recover, and retry.
+    /// - `Error::Io` / `Error::Storage`: transient environment errors; retry.
+    /// - `Error::Unrecoverable`: a prepared record cannot be decoded, or the keyspace
+    ///   holding prepared write-sets was lost. Permanent; needs operator intervention.
+    pub fn pending_prepared(&self) -> crate::Result<Vec<PreparedTxInfo>> {
+        if self.inner.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+
+        let Some(txn) = self.inner.reserved_keyspace()? else {
+            return Ok(Vec::new());
+        };
+
+        // NOTE: A snapshot sees every prepare and resolution batch whole, unlike a
+        // SeqNo::MAX scan, which could see part of a concurrent prepare
+        let nonce = self.inner.supervisor.snapshot_tracker.open();
+        let rows = read_rows(&txn, &[], nonce.instant)?;
+        drop(nonce);
+
+        let live = live_keyspaces_by_id(&self.inner);
+
+        // NOTE: Rows are in key order, so the rows of one xid are contiguous
+        let infos = rows
+            .chunk_by(|a, b| a.xid == b.xid)
+            .filter_map(|group| {
+                let first = group.first()?;
+
+                let mut keyspaces = Vec::new();
+                let mut missing_keyspace_ids = Vec::new();
+
+                for row in group {
+                    match live.get(&row.keyspace_id) {
+                        Some(keyspace) => keyspaces.push(keyspace.name.clone()),
+                        None => missing_keyspace_ids.push(row.keyspace_id),
+                    }
+                }
+
+                keyspaces.sort();
+                keyspaces.dedup();
+                missing_keyspace_ids.sort_unstable();
+                missing_keyspace_ids.dedup();
+
+                Some(PreparedTxInfo {
+                    xid: first.xid.clone(),
+                    item_count: group.len(),
+                    keyspaces,
+                    missing_keyspace_ids,
+                })
+            })
+            .collect();
+
+        Ok(infos)
+    }
+
+    /// The durable write-set of the in-doubt transaction `xid`: keys and kinds of
+    /// write, without values, ordered by keyspace id, then key.
+    ///
+    /// Empty if the xid is unknown or resolved. Reads at a snapshot instant like
+    /// [`OptimisticTxDatabase::pending_prepared`]. Use it to fence keys during
+    /// recovery, or to verify a re-executed branch against the durable prepare.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::Poisoned`: fatal; restart the process, recover, and retry.
+    /// - `Error::Io` / `Error::Storage`: transient environment errors; retry.
+    /// - `Error::Unrecoverable`: a prepared record cannot be decoded, or the keyspace
+    ///   holding prepared write-sets was lost. Permanent; needs operator intervention.
+    pub fn prepared_items(&self, xid: impl AsRef<[u8]>) -> crate::Result<Vec<PreparedItem>> {
+        if self.inner.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+
+        let Some(txn) = self.inner.reserved_keyspace()? else {
+            return Ok(Vec::new());
+        };
+
+        let Some(prefix) = xid_prefix(xid.as_ref()) else {
+            return Ok(Vec::new());
+        };
+
+        let nonce = self.inner.supervisor.snapshot_tracker.open();
+        let rows = read_rows(&txn, &prefix, nonce.instant)?;
+        drop(nonce);
+
+        let live = live_keyspaces_by_id(&self.inner);
+
+        let items = rows
+            .into_iter()
+            .map(|row| PreparedItem {
+                keyspace: live.get(&row.keyspace_id).map(|k| k.name.clone()),
+                keyspace_id: row.keyspace_id,
+                key: row.user_key,
+                kind: row.kind,
+            })
+            .collect();
+
+        Ok(items)
     }
 
     /// The reserved keyspace and the rows of `xid`, read at `SeqNo::MAX`.

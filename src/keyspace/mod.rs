@@ -34,6 +34,7 @@ use write_delay::perform_write_stall;
 /// Keyspace key (a.k.a. column family, locality group)
 pub type KeyspaceKey = byteview::StrView;
 
+/// Internal id of a keyspace
 pub type InternalKeyspaceId = u64;
 
 pub fn apply_to_base_config(
