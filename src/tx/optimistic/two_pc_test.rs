@@ -9,7 +9,11 @@ use crate::{
     KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PrepareOutcome, Readable,
     Resolution, Slice,
 };
-use lsm_tree::{AbstractTree, SeqNo};
+use lsm_tree::{
+    compaction::filter::{CompactionFilter, Context, Factory, ItemAccessor, Verdict},
+    AbstractTree, SeqNo,
+};
+use std::{fs::OpenOptions, sync::Arc};
 use test_log::test;
 
 fn open(folder: &tempfile::TempDir) -> crate::Result<OptimisticTxDatabase> {
@@ -510,5 +514,158 @@ fn prepare_fsyncs_whatever_the_durability_settings() -> crate::Result<()> {
     let mut tx = db.write_tx()?.durability(None);
     tx.insert(&a, "k", "v");
     assert!(matches!(tx.prepare("x"), Err(crate::Error::Poisoned)));
+    Ok(())
+}
+
+struct DropAll;
+impl CompactionFilter for DropAll {
+    fn filter_item(&mut self, _: ItemAccessor<'_>, _: &Context) -> lsm_tree::Result<Verdict> {
+        Ok(Verdict::Remove)
+    }
+}
+struct DropAllFactory;
+impl Factory for DropAllFactory {
+    fn name(&self) -> &str {
+        "drop-all"
+    }
+    fn make_filter(&self, _: &Context) -> Box<dyn CompactionFilter> {
+        Box::new(DropAll)
+    }
+}
+
+fn journal_end(db: &OptimisticTxDatabase) -> crate::Result<u64> {
+    db.inner().supervisor.journal.get_writer()?.pos()
+}
+
+/// Cuts the last byte of the journal's last frame, as a crash mid-write would.
+fn tear_last_frame(journal: &std::path::Path, end: u64) -> std::io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .open(journal)?
+        .set_len(end - 1)
+}
+
+#[test]
+fn torn_prepare_frame_is_not_prepared() -> crate::Result<()> {
+    // §9 row 2
+    let folder = tempfile::tempdir()?;
+    let (journal, end) = {
+        let db = open(&folder)?;
+        let a = keyspace(&db, "a")?;
+        prepare_one(&db, &a, "x", "k", "v")?;
+        (db.inner().supervisor.journal.path()?, journal_end(&db)?)
+    };
+    tear_last_frame(&journal, end)?;
+
+    let db = open(&folder)?;
+    let a = keyspace(&db, "a")?;
+    assert!(db.pending_prepared()?.is_empty());
+    assert_eq!(Resolution::NoOp, db.commit_prepared("x")?);
+    assert_eq!(None, a.get("k")?);
+    prepare_one(&db, &a, "x", "k", "v")?;
+    Ok(())
+}
+
+#[test]
+fn torn_commit_prepared_frame_leaves_the_xid_in_doubt() -> crate::Result<()> {
+    // §9 row 5
+    let folder = tempfile::tempdir()?;
+    let (journal, end) = {
+        let db = open(&folder)?;
+        let a = keyspace(&db, "a")?;
+        prepare_one(&db, &a, "x", "k", "v")?;
+        assert_eq!(
+            Resolution::Applied { dropped_items: 0 },
+            db.commit_prepared("x")?
+        );
+        (db.inner().supervisor.journal.path()?, journal_end(&db)?)
+    };
+    tear_last_frame(&journal, end)?;
+
+    {
+        let db = open(&folder)?;
+        let a = keyspace(&db, "a")?;
+        assert_eq!(1, db.prepared_items("x")?.len());
+        assert_eq!(None, a.get("k")?);
+        assert_eq!(
+            Resolution::Applied { dropped_items: 0 },
+            db.commit_prepared("x")?
+        );
+    }
+    let db = open(&folder)?;
+    let a = keyspace(&db, "a")?;
+    assert_eq!(Some("v".as_bytes().into()), a.get("k")?);
+    assert_eq!(Resolution::NoOp, db.commit_prepared("x")?);
+    Ok(())
+}
+
+#[test]
+fn flushed_rows_resolve_and_block_duplicates() -> crate::Result<()> {
+    // §10 flush/compaction row
+    let folder = tempfile::tempdir()?;
+    {
+        let db = open(&folder)?;
+        let a = keyspace(&db, "a")?;
+        prepare_one(&db, &a, "x", "k1", "v")?;
+        prepare_one(&db, &a, "y", "k2", "v")?;
+        let txn = db.inner().reserved_keyspace()?.expect("created");
+        txn.rotate_memtable_and_wait()?;
+        txn.major_compact()?;
+    }
+    let db = open(&folder)?;
+    let a = keyspace(&db, "a")?;
+    let mut tx = db.write_tx()?;
+    tx.insert(&a, "k3", "v");
+    assert!(matches!(tx.prepare("x"), Err(crate::Error::XidInUse)));
+    assert_eq!(
+        Resolution::Applied { dropped_items: 0 },
+        db.commit_prepared("x")?
+    );
+    assert_eq!(
+        Resolution::Applied { dropped_items: 0 },
+        db.rollback_prepared("y")?
+    );
+
+    let txn = db.inner().reserved_keyspace()?.expect("recovered");
+    txn.rotate_memtable_and_wait()?;
+    txn.major_compact()?;
+    assert!(db.pending_prepared()?.is_empty());
+    assert_eq!(Some("v".as_bytes().into()), a.get("k1")?);
+    assert_eq!(None, a.get("k2")?);
+    Ok(())
+}
+
+#[test]
+fn catch_all_compaction_filter_leaves_prepared_rows_alone() -> crate::Result<()> {
+    // §12 compaction filter
+    let folder = tempfile::tempdir()?;
+    let assigner: crate::db_config::CompactionFilterAssigner =
+        Arc::new(|_: &str| Some(Arc::new(DropAllFactory) as Arc<dyn Factory>));
+    let open_filtered = || {
+        OptimisticTxDatabase::builder(folder.path())
+            .with_compaction_filter_factories(assigner.clone())
+            .open()
+    };
+    {
+        let db = open_filtered()?;
+        let a = keyspace(&db, "a")?;
+        prepare_one(&db, &a, "x", "k", "v")?;
+        let txn = db.inner().reserved_keyspace()?.expect("created");
+        txn.rotate_memtable_and_wait()?;
+        txn.major_compact()?;
+        assert_eq!(1, db.prepared_items("x")?.len());
+    }
+    let db = open_filtered()?;
+    let a = keyspace(&db, "a")?;
+    prepare_one(&db, &a, "y", "k2", "v")?;
+    let txn = db.inner().reserved_keyspace()?.expect("recovered");
+    txn.rotate_memtable_and_wait()?;
+    txn.major_compact()?;
+    assert_eq!(1, db.prepared_items("x")?.len());
+    assert_eq!(
+        Resolution::Applied { dropped_items: 0 },
+        db.commit_prepared("x")?
+    );
+    assert_eq!(Some("v".as_bytes().into()), a.get("k")?);
     Ok(())
 }
