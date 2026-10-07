@@ -376,3 +376,139 @@ fn undecodable_row_does_not_fail_open() -> crate::Result<()> {
     assert_eq!(1, db.prepared_items("x")?.len());
     Ok(())
 }
+
+#[derive(Clone, Copy, Debug)]
+enum Fault {
+    JournalWrite,
+    Persist,
+}
+
+fn arm(db: &OptimisticTxDatabase, fault: Fault) -> crate::Result<()> {
+    let mut writer = db.inner().supervisor.journal.get_writer()?;
+    match fault {
+        Fault::JournalWrite => writer.fail_next_journal_write(),
+        Fault::Persist => writer.fail_next_persist(),
+    }
+    Ok(())
+}
+
+fn open_manual(folder: &tempfile::TempDir) -> crate::Result<OptimisticTxDatabase> {
+    OptimisticTxDatabase::builder(folder.path())
+        .manual_journal_persist(true)
+        .open()
+}
+
+#[test]
+fn failed_prepare_returns_poisoned_and_applies_nothing() -> crate::Result<()> {
+    // §9 row 3
+    for fault in [Fault::JournalWrite, Fault::Persist] {
+        let folder = tempfile::tempdir()?;
+        {
+            let db = open_manual(&folder)?;
+            let a = keyspace(&db, "a")?;
+            prepare_one(&db, &a, "warmup", "w", "v")?; // creates __fjall_txn
+            arm(&db, fault)?;
+
+            let mut tx = db.write_tx()?;
+            tx.insert(&a, "k", "v");
+            assert!(
+                matches!(tx.prepare("x"), Err(crate::Error::Poisoned)),
+                "{fault:?}"
+            );
+            assert!(db.inner().is_poisoned());
+            assert_eq!(
+                1,
+                rows(&db)?.len(),
+                "{fault:?}: nothing reached the memtable"
+            );
+            assert!(!is_reserved(&db, "x")?);
+
+            // No false Ok, NoOp or ReadOnly in the poisoned window
+            assert!(matches!(
+                db.write_tx()?.prepare("ro"),
+                Err(crate::Error::Poisoned)
+            ));
+            assert!(matches!(
+                db.commit_prepared("x"),
+                Err(crate::Error::Poisoned)
+            ));
+            assert!(matches!(
+                db.rollback_prepared("x"),
+                Err(crate::Error::Poisoned)
+            ));
+            assert!(matches!(db.pending_prepared(), Err(crate::Error::Poisoned)));
+            assert!(matches!(
+                db.prepared_items("x"),
+                Err(crate::Error::Poisoned)
+            ));
+        }
+
+        let db = open(&folder)?;
+        let a = keyspace(&db, "a")?;
+        let resurfaced = db.pending_prepared()?.iter().any(|info| &*info.xid == b"x");
+        match fault {
+            // The frame never reached the journal
+            Fault::JournalWrite => {
+                assert!(!resurfaced);
+                assert_eq!(Resolution::NoOp, db.commit_prepared("x")?);
+            }
+            // Written but not synced; closing the journal flushed it: it MAY resurface (§9)
+            Fault::Persist => {
+                assert!(resurfaced);
+                assert_eq!(
+                    Resolution::Applied { dropped_items: 0 },
+                    db.commit_prepared("x")?
+                );
+                assert_eq!(Some("v".as_bytes().into()), a.get("k")?);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn failed_resolution_returns_poisoned_and_applies_nothing() -> crate::Result<()> {
+    for fault in [Fault::JournalWrite, Fault::Persist] {
+        for commit in [true, false] {
+            let folder = tempfile::tempdir()?;
+            let db = open_manual(&folder)?;
+            let a = keyspace(&db, "a")?;
+            prepare_one(&db, &a, "x", "k", "v")?;
+            arm(&db, fault)?;
+
+            let outcome = if commit {
+                db.commit_prepared("x")
+            } else {
+                db.rollback_prepared("x")
+            };
+            assert!(
+                matches!(outcome, Err(crate::Error::Poisoned)),
+                "{fault:?} commit={commit}"
+            );
+            assert_eq!(None, a.get("k")?);
+            assert_eq!(1, rows(&db)?.len());
+            assert!(is_reserved(&db, "x")?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn prepare_fsyncs_whatever_the_durability_settings() -> crate::Result<()> {
+    // D21, first half
+    let folder = tempfile::tempdir()?;
+    let db = open_manual(&folder)?;
+    let a = keyspace(&db, "a")?;
+    prepare_one(&db, &a, "warmup", "w", "v")?;
+    arm(&db, Fault::Persist)?;
+
+    // Control: an ordinary commit without durability does not persist, so the fault stays armed
+    let mut tx = db.write_tx()?.durability(None);
+    tx.insert(&a, "plain", "v");
+    assert!(tx.commit()?.is_ok());
+
+    let mut tx = db.write_tx()?.durability(None);
+    tx.insert(&a, "k", "v");
+    assert!(matches!(tx.prepare("x"), Err(crate::Error::Poisoned)));
+    Ok(())
+}

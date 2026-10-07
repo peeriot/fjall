@@ -28,6 +28,14 @@ pub struct Writer {
 
     compression: CompressionType,
     compression_threshold: usize,
+
+    /// Test-only: the next `write_batch` fails before writing anything
+    #[cfg(any(test, feature = "__internal_whitebox"))]
+    journal_write_fault_armed: bool,
+
+    /// Test-only: the next syncing `persist` fails before flushing the buffer
+    #[cfg(any(test, feature = "__internal_whitebox"))]
+    persist_fault_armed: bool,
 }
 
 /// The persist mode allows setting the durability guarantee of previous writes
@@ -50,6 +58,31 @@ pub enum PersistMode {
 }
 
 impl Writer {
+    /// Test-only: the next `write_batch` returns `Err(Io)` before writing anything.
+    ///
+    /// One-shot. `rotate` replaces the writer and so disarms it.
+    #[cfg(any(test, feature = "__internal_whitebox"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "only the crate's own tests arm faults")
+    )]
+    pub(crate) fn fail_next_journal_write(&mut self) {
+        self.journal_write_fault_armed = true;
+    }
+
+    /// Test-only: the next `persist` with `SyncData` or `SyncAll` returns `Err` before
+    /// flushing the buffer, so whatever is buffered stays buffered.
+    ///
+    /// One-shot. A `Buffer` persist leaves it armed.
+    #[cfg(any(test, feature = "__internal_whitebox"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "only the crate's own tests arm faults")
+    )]
+    pub(crate) fn fail_next_persist(&mut self) {
+        self.persist_fault_armed = true;
+    }
+
     pub fn set_compression(&mut self, comp: CompressionType, threshold: usize) {
         self.compression = comp;
         self.compression_threshold = threshold;
@@ -146,6 +179,10 @@ impl Writer {
             is_buffer_dirty: false,
             compression: CompressionType::None,
             compression_threshold: 0,
+            #[cfg(any(test, feature = "__internal_whitebox"))]
+            journal_write_fault_armed: false,
+            #[cfg(any(test, feature = "__internal_whitebox"))]
+            persist_fault_armed: false,
         })
     }
 
@@ -179,6 +216,10 @@ impl Writer {
                 is_buffer_dirty: false,
                 compression: CompressionType::None,
                 compression_threshold: 0,
+                #[cfg(any(test, feature = "__internal_whitebox"))]
+                journal_write_fault_armed: false,
+                #[cfg(any(test, feature = "__internal_whitebox"))]
+                persist_fault_armed: false,
             });
         }
 
@@ -196,11 +237,20 @@ impl Writer {
             is_buffer_dirty: false,
             compression: CompressionType::None,
             compression_threshold: 0,
+            #[cfg(any(test, feature = "__internal_whitebox"))]
+            journal_write_fault_armed: false,
+            #[cfg(any(test, feature = "__internal_whitebox"))]
+            persist_fault_armed: false,
         })
     }
 
     /// Persists the journal file.
     pub(crate) fn persist(&mut self, mode: PersistMode) -> std::io::Result<()> {
+        #[cfg(any(test, feature = "__internal_whitebox"))]
+        if mode != PersistMode::Buffer && std::mem::take(&mut self.persist_fault_armed) {
+            return Err(std::io::Error::other("injected persist failure"));
+        }
+
         log::trace!(
             "Persisting journal at {} with mode={mode:?}",
             self.path.display(),
@@ -331,6 +381,11 @@ impl Writer {
     ) -> crate::Result<usize> {
         if batch_size == 0 {
             return Ok(0);
+        }
+
+        #[cfg(any(test, feature = "__internal_whitebox"))]
+        if std::mem::take(&mut self.journal_write_fault_armed) {
+            return Err(std::io::Error::other("injected journal write failure").into());
         }
 
         self.is_buffer_dirty = true;
