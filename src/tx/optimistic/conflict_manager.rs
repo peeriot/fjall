@@ -21,6 +21,19 @@ enum Read {
     All,
 }
 
+/// Returns `true` if `BTreeSet::range` panics on these bounds: start above end, or
+/// start equal to end with both excluded.
+fn is_rejected_by_btree_range(start: &Bound<Slice>, end: &Bound<Slice>) -> bool {
+    match (start, end) {
+        (Bound::Excluded(start), Bound::Excluded(end)) => start >= end,
+        (
+            Bound::Included(start) | Bound::Excluded(start),
+            Bound::Included(end) | Bound::Excluded(end),
+        ) => start > end,
+        _ => false,
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct ConflictManager {
     reads: Mutex<BTreeMap<InternalKeyspaceId, Vec<Read>>>,
@@ -66,6 +79,12 @@ impl ConflictManager {
             Bound::Excluded(k) => Bound::Excluded(k.clone()),
             Bound::Unbounded => Bound::Unbounded,
         };
+
+        // NOTE: A range that reads nothing constrains nothing, and `BTreeSet::range`
+        // panics on its bounds, under the oracle lock in `has_conflict`
+        if is_rejected_by_btree_range(&start, &end) {
+            return;
+        }
 
         let read = if start == Bound::Unbounded && end == Bound::Unbounded {
             Read::All
@@ -230,6 +249,7 @@ impl ConflictManager {
 #[cfg(test)]
 mod tests {
     use super::ConflictManager;
+    use lsm_tree::Slice;
 
     #[test]
     fn write_overlap_is_per_keyspace() {
@@ -246,5 +266,30 @@ mod tests {
         let reader = ConflictManager::default();
         reader.mark_read(1, "k".into());
         assert!(!reader.has_write_overlap(&a));
+    }
+
+    #[test]
+    fn empty_range_reads_never_conflict() {
+        use std::ops::Bound::{Excluded, Included};
+
+        let writer = ConflictManager::default();
+        for key in ["b", "m", "z"] {
+            writer.mark_conflict(1, key.into());
+        }
+
+        // Each reads nothing; the first five are bounds `BTreeSet::range` rejects
+        for (start, end) in [
+            (Included("z"), Included("b")),
+            (Included("z"), Excluded("b")),
+            (Excluded("z"), Included("b")),
+            (Excluded("z"), Excluded("b")),
+            (Excluded("m"), Excluded("m")),
+            (Included("m"), Excluded("m")),
+            (Excluded("m"), Included("m")),
+        ] {
+            let reader = ConflictManager::default();
+            reader.mark_range(1, (start.map(Slice::from), end.map(Slice::from)));
+            assert!(!reader.has_conflict(&writer), "{start:?}..{end:?}");
+        }
     }
 }

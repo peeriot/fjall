@@ -5,6 +5,7 @@ use fjall::{
     Conflict, KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PrepareOutcome,
     Readable,
 };
+use std::ops::Bound;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 use test_log::test;
@@ -334,6 +335,58 @@ fn reservation_survives_committed_txns_gc() -> fjall::Result<()> {
     t.get(&a, "k")?;
     t.insert(&a, "elsewhere", "x");
     assert!(matches!(t.commit()?, Err(Conflict)));
+    Ok(())
+}
+
+/// Range reads that read nothing, with bounds `BTreeSet::range` rejects: inverted, and
+/// equal with both excluded. Both enclose or touch the key "m".
+fn empty_range_reads() -> [(Bound<&'static str>, Bound<&'static str>); 2] {
+    [
+        (Bound::Included("z"), Bound::Excluded("b")),
+        (Bound::Excluded("m"), Bound::Excluded("m")),
+    ]
+}
+
+#[test]
+fn empty_range_read_commits_after_a_concurrent_commit() -> fjall::Result<()> {
+    for range in empty_range_reads() {
+        let folder = tempfile::tempdir()?;
+        let (db, a) = setup(&folder)?;
+
+        let mut t = db.write_tx()?;
+        assert_eq!(0, t.range::<&str, _>(&a, range).count());
+        a.insert("m", "concurrent")?;
+        t.insert(&a, "elsewhere", "t");
+        assert!(t.commit()?.is_ok(), "{range:?}");
+
+        // The oracle lock is not poisoned
+        let mut u = db.write_tx()?;
+        u.insert(&a, "after", "u");
+        assert!(u.commit()?.is_ok(), "{range:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn empty_range_read_commits_while_a_prepare_is_pending() -> fjall::Result<()> {
+    for range in empty_range_reads() {
+        let folder = tempfile::tempdir()?;
+        let (db, a) = setup(&folder)?;
+        assert!(matches!(
+            prepare_put(&db, &a, "p", "m", "v")?,
+            Ok(PrepareOutcome::Prepared)
+        ));
+
+        let mut t = db.write_tx()?;
+        assert_eq!(0, t.range::<&str, _>(&a, range).count());
+        t.insert(&a, "elsewhere", "t");
+        assert!(t.commit()?.is_ok(), "{range:?}");
+
+        // The oracle lock is not poisoned
+        let mut u = db.write_tx()?;
+        u.insert(&a, "after", "u");
+        assert!(u.commit()?.is_ok(), "{range:?}");
+    }
     Ok(())
 }
 
