@@ -11,17 +11,29 @@ mod two_pc_test;
 mod write_tx;
 
 use crate::{
+    batch::{item::Item, WriteBatch},
     keyspace::KeyspaceKey,
-    tx::{optimistic::oracle::Oracle, single_writer::Openable},
-    Config, Database, KeyspaceCreateOptions, PersistMode, Snapshot,
+    tx::{
+        optimistic::{
+            conflict_manager::ConflictManager,
+            oracle::Oracle,
+            two_pc::{
+                live_keyspaces_by_id, normalize_batch_error, read_rows, request_compaction,
+                xid_prefix, PreparedRow,
+            },
+        },
+        single_writer::Openable,
+    },
+    Config, Database, Keyspace, KeyspaceCreateOptions, PersistMode, Snapshot,
 };
+use lsm_tree::{SeqNo, Slice, ValueType};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
 
 pub use keyspace::OptimisticTxKeyspace;
-pub use two_pc::{PrepareOutcome, PreparedItemKind};
+pub use two_pc::{PrepareOutcome, PreparedItemKind, Resolution};
 pub use write_tx::{Conflict, UntrackedWriteTransaction, WriteTransaction};
 
 /// Transactional database
@@ -89,6 +101,185 @@ impl OptimisticTxDatabase {
         }
 
         Ok(write_tx)
+    }
+
+    /// Phase 2 of two-phase commit: applies the write-set prepared under `xid`.
+    ///
+    /// Idempotent: an unknown or already resolved xid is a [`Resolution::NoOp`].
+    /// Never fails with a conflict. Items whose target keyspace was deleted are
+    /// dropped and counted in [`Resolution::Applied`].
+    ///
+    /// The write-set is applied and its prepared record deleted in one atomic,
+    /// fsynced batch, so a crash leaves either both or neither. A transaction that
+    /// read any of the applied keys before the apply cannot commit afterwards.
+    ///
+    /// A `NoOp` on the FIRST resolution attempt of a branch that voted `Prepared`
+    /// indicates lost prepared state or out-of-band interference: coordinators
+    /// should raise an alarm.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::Poisoned`: fatal; restart the process, recover, and retry.
+    /// - `Error::Io` / `Error::Storage`: transient environment errors; retry.
+    /// - `Error::Unrecoverable`: a prepared record cannot be decoded, or the keyspace
+    ///   holding prepared write-sets was lost. Permanent; needs operator intervention.
+    pub fn commit_prepared(&self, xid: impl AsRef<[u8]>) -> crate::Result<Resolution> {
+        let xid = xid.as_ref();
+
+        if self.inner.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+
+        let mut state = self.oracle.write_serialize_lock()?;
+
+        let Some((txn, rows)) = self.rows_to_resolve(xid)? else {
+            // NOTE: Defensive; a reservation never outlives its rows
+            state.reservations.remove(xid);
+            return Ok(Resolution::NoOp);
+        };
+
+        // NOTE: The keyspace map's guard is released before the batch commit, which
+        // takes that lock itself
+        let live = live_keyspaces_by_id(&self.inner);
+
+        let mut dropped_items = 0;
+
+        let mut batch = WriteBatch::new(self.inner.clone()).durability(Some(PersistMode::SyncAll));
+        batch.data.reserve_exact(rows.len() * 2);
+
+        for row in &rows {
+            if let Some(target) = live.get(&row.keyspace_id) {
+                let payload = match row.kind {
+                    PreparedItemKind::Put => row.user_value.clone(),
+                    PreparedItemKind::Delete | PreparedItemKind::WeakDelete => Slice::empty(),
+                };
+
+                batch.data.push(Item::new(
+                    target.clone(),
+                    row.user_key.clone(),
+                    payload,
+                    row.kind.value_type(),
+                ));
+            } else {
+                dropped_items += 1;
+            }
+
+            batch.data.push(Self::row_tombstone(&txn, row));
+        }
+
+        batch
+            .commit()
+            .map_err(|e| normalize_batch_error(&self.inner, e))?;
+
+        // Register the applied write-set, so transactions that read the old values
+        // cannot commit after the apply
+        let applied = state.reservations.remove(xid).unwrap_or_else(|| {
+            // NOTE: After a restart, prepares are not reserved
+            let applied = ConflictManager::default();
+            for row in &rows {
+                applied.mark_conflict(row.keyspace_id, row.user_key.clone());
+            }
+            applied
+        });
+
+        // IMPORTANT: Sampled after the batch commit has published, so the key is above
+        // the snapshot of every transaction that could have read the old values
+        state
+            .committed_txns
+            .insert(self.oracle.snapshot_tracker.get(), applied);
+
+        drop(state);
+
+        request_compaction(&txn);
+
+        Ok(Resolution::Applied { dropped_items })
+    }
+
+    /// Phase 2 of two-phase commit: discards the write-set prepared under `xid`.
+    ///
+    /// Idempotent: an unknown or already resolved xid is a [`Resolution::NoOp`].
+    /// The prepared record is deleted in one fsynced batch; the target keyspaces are
+    /// never touched.
+    ///
+    /// A `NoOp` on the FIRST resolution attempt of a branch that voted `Prepared`
+    /// indicates lost prepared state or out-of-band interference: coordinators
+    /// should raise an alarm.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::Poisoned`: fatal; restart the process, recover, and retry.
+    /// - `Error::Io` / `Error::Storage`: transient environment errors; retry.
+    /// - `Error::Unrecoverable`: a prepared record cannot be decoded, or the keyspace
+    ///   holding prepared write-sets was lost. Permanent; needs operator intervention.
+    pub fn rollback_prepared(&self, xid: impl AsRef<[u8]>) -> crate::Result<Resolution> {
+        let xid = xid.as_ref();
+
+        if self.inner.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+
+        let mut state = self.oracle.write_serialize_lock()?;
+
+        let Some((txn, rows)) = self.rows_to_resolve(xid)? else {
+            // NOTE: Defensive; a reservation never outlives its rows
+            state.reservations.remove(xid);
+            return Ok(Resolution::NoOp);
+        };
+
+        let mut batch = WriteBatch::new(self.inner.clone()).durability(Some(PersistMode::SyncAll));
+        batch.data.reserve_exact(rows.len());
+
+        for row in &rows {
+            batch.data.push(Self::row_tombstone(&txn, row));
+        }
+
+        batch
+            .commit()
+            .map_err(|e| normalize_batch_error(&self.inner, e))?;
+
+        // NOTE: Nothing became visible, so nothing is registered as committed
+        state.reservations.remove(xid);
+
+        drop(state);
+
+        request_compaction(&txn);
+
+        Ok(Resolution::Applied { dropped_items: 0 })
+    }
+
+    /// The reserved keyspace and the rows of `xid`, read at `SeqNo::MAX`.
+    ///
+    /// `None` if nothing was ever prepared or `xid` has no rows. Never creates the
+    /// reserved keyspace.
+    fn rows_to_resolve(&self, xid: &[u8]) -> crate::Result<Option<(Keyspace, Vec<PreparedRow>)>> {
+        let Some(txn) = self.inner.reserved_keyspace()? else {
+            return Ok(None);
+        };
+
+        let Some(prefix) = xid_prefix(xid) else {
+            return Ok(None);
+        };
+
+        // NOTE: Read at SeqNo::MAX under the oracle lock: a concurrent resolution of
+        // the same xid has either not started or its tombstones are visible
+        let rows = read_rows(&txn, &prefix, SeqNo::MAX)?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some((txn, rows)))
+    }
+
+    /// A regular (never weak) tombstone for a prepared row.
+    fn row_tombstone(txn: &Keyspace, row: &PreparedRow) -> Item {
+        // NOTE: A weak tombstone could resurrect an older generation of the row
+        Item::new(
+            txn.clone(),
+            row.row_key.clone(),
+            Slice::empty(),
+            ValueType::Tombstone,
+        )
     }
 
     /// Starts a new read-only transaction (a.k.a. [`Snapshot`]).

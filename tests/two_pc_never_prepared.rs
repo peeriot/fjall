@@ -1,7 +1,9 @@
 mod common;
 
 use common::keyspace_dirs;
-use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PrepareOutcome};
+use fjall::{
+    KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PrepareOutcome, Resolution,
+};
 use test_log::test;
 
 fn sorted_names(db: &OptimisticTxDatabase) -> Vec<String> {
@@ -36,6 +38,8 @@ fn exercise(
         db.write_tx()?.prepare("ro")?,
         Ok(PrepareOutcome::ReadOnly)
     ));
+    assert_eq!(Resolution::NoOp, db.commit_prepared("ro")?);
+    assert_eq!(Resolution::NoOp, db.rollback_prepared("nope")?);
     Ok(())
 }
 

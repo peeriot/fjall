@@ -29,6 +29,14 @@ fn lost_reserved_keyspace_fails_every_2pc_call() -> fjall::Result<()> {
         Err(fjall::Error::Unrecoverable)
     ));
     // Tasks 6 and 7 add the resolution and enumeration calls here.
+    assert!(matches!(
+        db.commit_prepared("x"),
+        Err(fjall::Error::Unrecoverable)
+    ));
+    assert!(matches!(
+        db.rollback_prepared("x"),
+        Err(fjall::Error::Unrecoverable)
+    ));
 
     assert_eq!(vec!["0", "1"], keyspace_dirs(folder.path())?);
     let mut tx = db.write_tx()?;

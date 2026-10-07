@@ -13,7 +13,7 @@
 
 #![cfg_attr(not(test), allow(dead_code, reason = "wired up by Tasks 5-8"))]
 
-use crate::{keyspace::InternalKeyspaceId, Database, Keyspace};
+use crate::{keyspace::InternalKeyspaceId, worker_pool::WorkerMessage, Database, Keyspace};
 use byteorder::{ReadBytesExt, WriteBytesExt, BE};
 use lsm_tree::{AbstractTree, Guard, SeqNo, Slice, ValueType};
 
@@ -27,6 +27,23 @@ pub enum PrepareOutcome {
     ///
     /// Requires no phase 2; it will never be reported as pending.
     ReadOnly,
+}
+
+/// Outcome of a successful resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// The prepared write-set was applied (commit) or discarded (rollback) by THIS call.
+    Applied {
+        /// Items skipped because their target keyspace no longer exists
+        /// (always 0 for `rollback_prepared`)
+        dropped_items: usize,
+    },
+
+    /// Nothing to do: the xid is unknown or already resolved.
+    ///
+    /// Safe on retries; a `NoOp` on the FIRST resolution attempt of a branch that
+    /// voted `Prepared` indicates lost prepared state or out-of-band interference.
+    NoOp,
 }
 
 /// Kind of a prepared write.
@@ -234,7 +251,6 @@ pub fn check_item_size(
 /// One decoded `__fjall_txn` row.
 pub struct PreparedRow {
     /// The stored composite key, tombstoned at resolution
-    #[allow(dead_code, reason = "used by a later commit")]
     pub row_key: Slice,
 
     /// The prepared transaction's xid
@@ -311,6 +327,29 @@ pub fn has_rows(txn: &Keyspace, xid: &[u8]) -> crate::Result<bool> {
         }
         None => Ok(false),
     }
+}
+
+/// Live keyspaces by id, from the supervisor's keyspace map.
+///
+/// The map's read guard is released on return, so the result can be used across
+/// a batch commit.
+pub fn live_keyspaces_by_id(db: &Database) -> crate::HashMap<InternalKeyspaceId, Keyspace> {
+    #[expect(clippy::expect_used)]
+    let keyspaces = db.supervisor.keyspaces.read().expect("lock is poisoned");
+
+    keyspaces
+        .values()
+        .map(|keyspace| (keyspace.id, keyspace.clone()))
+        .collect()
+}
+
+/// Asks the worker pool to compact `txn`, so resolved rows are garbage collected.
+///
+/// Never blocks; if the request cannot be queued, it is dropped.
+pub fn request_compaction(txn: &Keyspace) {
+    txn.worker_messager
+        .try_send(WorkerMessage::Compact(txn.clone()))
+        .ok();
 }
 
 /// Maps the error of a failed 2PC batch commit to `Error::Poisoned` if the database

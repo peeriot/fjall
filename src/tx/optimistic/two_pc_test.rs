@@ -7,9 +7,9 @@
 use crate::{
     tx::optimistic::{conflict_manager::ConflictManager, two_pc::*},
     KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PrepareOutcome, Readable,
-    Slice,
+    Resolution, Slice,
 };
-use lsm_tree::SeqNo;
+use lsm_tree::{AbstractTree, SeqNo};
 use test_log::test;
 
 fn open(folder: &tempfile::TempDir) -> crate::Result<OptimisticTxDatabase> {
@@ -43,7 +43,6 @@ fn prepare_one(
 }
 
 /// Whether the oracle holds a reservation for `xid`.
-#[allow(dead_code, reason = "used by a later commit")]
 fn is_reserved(db: &OptimisticTxDatabase, xid: &str) -> crate::Result<bool> {
     Ok(db
         .oracle
@@ -194,6 +193,23 @@ fn poisoned_database_refuses_every_2pc_call() -> crate::Result<()> {
         "before the duplicate check"
     );
     assert_eq!(1, rows(&db)?.len());
+    assert!(matches!(
+        db.commit_prepared("x"),
+        Err(crate::Error::Poisoned)
+    ));
+    assert!(matches!(
+        db.rollback_prepared("x"),
+        Err(crate::Error::Poisoned)
+    ));
+    assert!(
+        matches!(db.commit_prepared("unknown"), Err(crate::Error::Poisoned)),
+        "no false NoOp"
+    );
+    assert!(matches!(
+        db.rollback_prepared("unknown"),
+        Err(crate::Error::Poisoned)
+    ));
+    assert_eq!(None, a.get("k")?);
     Ok(())
 }
 
@@ -208,5 +224,123 @@ fn poisoned_database_creates_nothing() -> crate::Result<()> {
     tx.insert(&a, "k", "v");
     assert!(matches!(tx.prepare("x"), Err(crate::Error::Poisoned)));
     assert!(db.inner().reserved_keyspace()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn undecodable_rows_are_unrecoverable() -> crate::Result<()> {
+    let cases: [(Slice, Slice); 3] = [
+        (encode_row_key(b"x", 1, b"k"), Slice::from(&[9u8, 0][..])), // unknown format_version
+        (encode_row_key(b"x", 1, b"k"), Slice::from(&[1u8, 7][..])), // unknown value_type
+        (
+            Slice::from(&[0u8, 1, b'x', 0, 0][..]),
+            encode_row_value(PreparedItemKind::Put, b"v"),
+        ), // key too short
+    ];
+    for (key, value) in cases {
+        let folder = tempfile::tempdir()?;
+        let db = open(&folder)?;
+        let a = keyspace(&db, "a")?;
+        let txn = db.inner().reserved_keyspace_or_create()?;
+        txn.insert(key, value)?;
+
+        assert!(matches!(
+            db.commit_prepared("x"),
+            Err(crate::Error::Unrecoverable)
+        ));
+        assert!(matches!(
+            db.rollback_prepared("x"),
+            Err(crate::Error::Unrecoverable)
+        ));
+        assert_eq!(1, txn.len()?, "the row was neither skipped nor removed");
+        assert_eq!(None, a.get("k")?);
+    }
+    Ok(())
+}
+
+#[test]
+fn no_op_resolution_clears_a_stray_reservation() -> crate::Result<()> {
+    for with_keyspace in [false, true] {
+        let folder = tempfile::tempdir()?;
+        let db = open(&folder)?;
+        let a = keyspace(&db, "a")?;
+        if with_keyspace {
+            prepare_one(&db, &a, "other", "o", "v")?;
+        }
+        let stray = ConflictManager::default();
+        stray.mark_conflict(a.inner().id(), "k".into());
+        db.oracle
+            .write_serialize_lock()?
+            .reservations
+            .insert("ghost".into(), stray);
+        assert!(matches!(
+            a.insert("k", "v"),
+            Err(crate::Error::PreparedConflict)
+        ));
+
+        let outcome = if with_keyspace {
+            db.rollback_prepared("ghost")?
+        } else {
+            db.commit_prepared("ghost")?
+        };
+        assert_eq!(Resolution::NoOp, outcome);
+        assert!(!is_reserved(&db, "ghost")?);
+        a.insert("k", "v")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn resolution_writes_regular_tombstones() -> crate::Result<()> {
+    // §7.2 step 3: never weak
+    let folder = tempfile::tempdir()?;
+    let db = open(&folder)?;
+    let a = keyspace(&db, "a")?;
+    prepare_one(&db, &a, "c", "k1", "v")?;
+    prepare_one(&db, &a, "r", "k2", "v")?;
+    assert_eq!(
+        Resolution::Applied { dropped_items: 0 },
+        db.commit_prepared("c")?
+    );
+    assert_eq!(
+        Resolution::Applied { dropped_items: 0 },
+        db.rollback_prepared("r")?
+    );
+
+    let txn = db.inner().reserved_keyspace()?.expect("created");
+    for (xid, key) in [(&b"c"[..], &b"k1"[..]), (&b"r"[..], &b"k2"[..])] {
+        let entry = txn
+            .tree
+            .active_memtable()
+            .get(&encode_row_key(xid, a.inner().id(), key), SeqNo::MAX)
+            .expect("tombstone in the memtable");
+        assert_eq!(lsm_tree::ValueType::Tombstone, entry.key.value_type);
+    }
+    Ok(())
+}
+
+#[test]
+fn reused_xid_after_resolution_is_a_new_generation() -> crate::Result<()> {
+    // §10 "reuse after quiescence"
+    let folder = tempfile::tempdir()?;
+    let db = open(&folder)?;
+    let a = keyspace(&db, "a")?;
+    prepare_one(&db, &a, "x", "k", "1")?;
+    assert_eq!(
+        Resolution::Applied { dropped_items: 0 },
+        db.commit_prepared("x")?
+    );
+    prepare_one(&db, &a, "x", "k", "2")?;
+    assert_eq!(
+        Resolution::Applied { dropped_items: 0 },
+        db.commit_prepared("x")?
+    );
+    assert_eq!(Some("2".as_bytes().into()), a.get("k")?);
+
+    let txn = db.inner().reserved_keyspace()?.expect("created");
+    txn.rotate_memtable_and_wait()?;
+    txn.major_compact()?;
+    assert!(rows(&db)?.is_empty());
+    assert_eq!(Resolution::NoOp, db.commit_prepared("x")?);
     Ok(())
 }
