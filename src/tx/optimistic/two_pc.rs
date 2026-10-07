@@ -12,7 +12,7 @@
 //! ```
 
 use crate::{
-    keyspace::{InternalKeyspaceId, KeyspaceKey},
+    keyspace::{name::is_reserved_keyspace_name, InternalKeyspaceId, KeyspaceKey},
     worker_pool::WorkerMessage,
     Database, Keyspace,
 };
@@ -370,7 +370,9 @@ pub fn has_rows(txn: &Keyspace, xid: &[u8]) -> crate::Result<bool> {
     }
 }
 
-/// Live keyspaces by id, from the supervisor's keyspace map.
+/// Live keyspaces by id, from the supervisor's keyspace map, without the internal
+/// keyspaces: a prepared row never targets one, so it is resolved like a deleted
+/// keyspace.
 ///
 /// The map's read guard is released on return, so the result can be used across
 /// a batch commit.
@@ -380,6 +382,7 @@ pub fn live_keyspaces_by_id(db: &Database) -> crate::HashMap<InternalKeyspaceId,
 
     keyspaces
         .values()
+        .filter(|keyspace| !is_reserved_keyspace_name(&keyspace.name))
         .map(|keyspace| (keyspace.id, keyspace.clone()))
         .collect()
 }

@@ -439,6 +439,35 @@ fn resolution_writes_regular_tombstones() -> crate::Result<()> {
 }
 
 #[test]
+fn row_targeting_the_hidden_keyspace_is_unresolvable() -> crate::Result<()> {
+    // §7.2 step 2: the hidden keyspace is never a target
+    let folder = tempfile::tempdir()?;
+    let db = open(&folder)?;
+    let _a = keyspace(&db, "a")?;
+    let txn = db.inner().reserved_keyspace_or_create()?;
+    txn.insert(
+        encode_row_key(b"x", txn.id(), b"k"),
+        encode_row_value(PreparedItemKind::Put, b"v"),
+    )?;
+
+    let pending = db.pending_prepared()?;
+    assert_eq!(1, pending.len());
+    assert!(pending[0].keyspaces.is_empty(), "{pending:?}");
+    assert_eq!(vec![txn.id()], pending[0].missing_keyspace_ids);
+    let items = db.prepared_items("x")?;
+    assert_eq!(1, items.len());
+    assert_eq!(None, items[0].keyspace);
+
+    assert_eq!(
+        Resolution::Applied { dropped_items: 1 },
+        db.commit_prepared("x")?
+    );
+    assert!(rows(&db)?.is_empty());
+    assert_eq!(0, txn.len()?);
+    Ok(())
+}
+
+#[test]
 fn commit_prepared_applies_the_recorded_tombstone_kind() -> crate::Result<()> {
     // §6 value_type: `remove` applies as a regular tombstone, `remove_weak` as a weak one
     use lsm_tree::ValueType::{Tombstone, Value, WeakTombstone};
