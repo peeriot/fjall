@@ -152,6 +152,10 @@ pub const MAX_ROW_KEY_LEN: usize = 65_535;
 /// Longest user value a row can hold: the row value adds 2 bytes and must fit a `u32` length.
 pub const MAX_PREPARED_VALUE_LEN: usize = 4_294_967_293; // u32::MAX - 2
 
+/// Lowest keyspace id that is never issued: lsm-tree's id counter reserves the most
+/// significant bit and panics instead of issuing it.
+pub const FIRST_IMPOSSIBLE_KEYSPACE_ID: InternalKeyspaceId = 0x8000_0000_0000_0000;
+
 /// The decoded key of a `__fjall_txn` row.
 pub struct RowKey {
     /// The prepared transaction's xid
@@ -393,7 +397,10 @@ pub fn request_compaction(txn: &Keyspace) {
 /// and tables.
 ///
 /// A row whose key cannot be decoded is logged at error level and skipped: it can
-/// never be applied, and failing here would make the database unopenable.
+/// never be applied, and failing here would make the database unopenable. So is a
+/// row whose target id is within one of [`FIRST_IMPOSSIBLE_KEYSPACE_ID`] or above it:
+/// raising the counter to that value would make every later keyspace creation panic,
+/// and no real database gets anywhere near such an id.
 ///
 /// # Errors
 ///
@@ -405,7 +412,14 @@ pub fn max_target_keyspace_id(txn: &Keyspace) -> crate::Result<Option<InternalKe
         let row_key = guard.key()?;
 
         match decode_row_key(&row_key) {
-            Ok(key) => max_id = max_id.max(Some(key.keyspace_id)),
+            // NOTE: The caller raises the counter to `id + 1`, so the last issuable id is skipped too
+            Ok(key) if key.keyspace_id < FIRST_IMPOSSIBLE_KEYSPACE_ID - 1 => {
+                max_id = max_id.max(Some(key.keyspace_id));
+            }
+            Ok(key) => log::error!(
+                "Skipping row with impossible target keyspace id {} in the prepared transactions keyspace (key={row_key:?})",
+                key.keyspace_id,
+            ),
             Err(_) => log::error!(
                 "Skipping undecodable row in the prepared transactions keyspace (key={row_key:?})",
             ),

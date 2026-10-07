@@ -381,6 +381,34 @@ fn undecodable_row_does_not_fail_open() -> crate::Result<()> {
     Ok(())
 }
 
+#[test]
+fn impossible_target_ids_do_not_exhaust_the_keyspace_ids() -> crate::Result<()> {
+    // §7.5: ids lsm-tree's id counter can never issue
+    let folder = tempfile::tempdir()?;
+    {
+        let db = open(&folder)?;
+        let a = keyspace(&db, "a")?;
+        prepare_one(&db, &a, "x", "k", "v")?;
+        let txn = db.inner().reserved_keyspace()?.expect("created");
+        for (xid, target_id) in [
+            (&b"y"[..], u64::MAX - 1),
+            (&b"z"[..], 0x8000_0000_0000_0000),
+            // The last id the counter can issue: raising the counter past it is just as fatal
+            (&b"w"[..], 0x7FFF_FFFF_FFFF_FFFF),
+        ] {
+            txn.insert(
+                encode_row_key(xid, target_id, b"k"),
+                encode_row_value(PreparedItemKind::Put, b"v"),
+            )?;
+        }
+    }
+    let db = open(&folder)?; // logs the rows, does not fail
+    let b = keyspace(&db, "b")?;
+    assert_eq!(3, b.inner().id());
+    b.insert("k", "v")?;
+    Ok(())
+}
+
 /// Seals the active journal and deletes every journal whose writes are all flushed.
 fn evict_journals(db: &OptimisticTxDatabase) -> crate::Result<()> {
     let supervisor = &db.inner().supervisor;
