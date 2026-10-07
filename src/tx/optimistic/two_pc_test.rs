@@ -439,6 +439,40 @@ fn resolution_writes_regular_tombstones() -> crate::Result<()> {
 }
 
 #[test]
+fn commit_prepared_applies_the_recorded_tombstone_kind() -> crate::Result<()> {
+    // §6 value_type: `remove` applies as a regular tombstone, `remove_weak` as a weak one
+    use lsm_tree::ValueType::{Tombstone, Value, WeakTombstone};
+
+    let folder = tempfile::tempdir()?;
+    let db = open(&folder)?;
+    let a = keyspace(&db, "a")?;
+    let mut tx = db.write_tx()?;
+    tx.insert(&a, "put", "v");
+    tx.remove(&a, "delete");
+    tx.remove_weak(&a, "weak");
+    assert!(matches!(tx.prepare("x")?, Ok(PrepareOutcome::Prepared)));
+    assert_eq!(
+        Resolution::Applied { dropped_items: 0 },
+        db.commit_prepared("x")?
+    );
+
+    for (key, value_type) in [
+        ("put", Value),
+        ("delete", Tombstone),
+        ("weak", WeakTombstone),
+    ] {
+        let entry = a
+            .inner()
+            .tree
+            .active_memtable()
+            .get(key.as_bytes(), SeqNo::MAX)
+            .expect("applied to the memtable");
+        assert_eq!(value_type, entry.key.value_type, "{key}");
+    }
+    Ok(())
+}
+
+#[test]
 fn reused_xid_after_resolution_is_a_new_generation() -> crate::Result<()> {
     // §10 "reuse after quiescence"
     let folder = tempfile::tempdir()?;
