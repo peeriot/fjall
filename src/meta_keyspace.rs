@@ -202,6 +202,22 @@ impl MetaKeyspace {
         }))
     }
 
+    /// Returns `true` if some `n`-prefixed id→name entry maps to `name` (read at `SeqNo::MAX`).
+    ///
+    /// Scans every id→name entry (one per keyspace), so it does not depend on the
+    /// supervisor's keyspace map.
+    pub(crate) fn is_name_mapped(&self, name: &str) -> crate::Result<bool> {
+        use lsm_tree::Guard;
+
+        for kv in self.inner.prefix(b"n", SeqNo::MAX, None) {
+            if kv.value()? == name.as_bytes() {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     pub(crate) fn keyspace_exists(&self, name: &str) -> bool {
         self.keyspaces
             .read()
@@ -460,6 +476,21 @@ mod tests {
             .expect("meta keyspace has entries");
         assert!(db.supervisor.seqno.get() > highest);
 
+        Ok(())
+    }
+
+    #[test]
+    fn is_name_mapped_follows_creation_and_deletion() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let db = Database::builder(&folder).open()?;
+        assert!(!db.meta_keyspace.is_name_mapped("a")?);
+
+        let a = db.keyspace("a", KeyspaceCreateOptions::default)?;
+        assert!(db.meta_keyspace.is_name_mapped("a")?);
+        assert!(!db.meta_keyspace.is_name_mapped("b")?);
+
+        db.delete_keyspace(a)?;
+        assert!(!db.meta_keyspace.is_name_mapped("a")?);
         Ok(())
     }
 

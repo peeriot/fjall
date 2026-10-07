@@ -121,6 +121,7 @@ mod path;
 mod poison;
 mod readable;
 mod recovery;
+mod reserved_keyspace;
 mod snapshot;
 mod snapshot_nonce;
 mod snapshot_tracker;

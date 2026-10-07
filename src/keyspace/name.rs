@@ -6,7 +6,6 @@
 pub const RESERVED_KEYSPACE_PREFIX: &str = "__fjall";
 
 /// Name of the internal keyspace that holds prepared (two-phase commit) write-sets.
-#[allow(dead_code, reason = "used by a later commit")]
 pub const TXN_KEYSPACE_NAME: &str = "__fjall_txn";
 
 /// Returns `true` if the name is reserved for an internal keyspace,

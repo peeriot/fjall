@@ -8,7 +8,10 @@ use crate::{
     file::{fsync_directory, KEYSPACES_FOLDER, LOCK_FILE, VERSION_MARKER},
     flush::manager::FlushManager,
     journal::{manager::JournalManager, writer::PersistMode, Journal},
-    keyspace::{name::is_valid_keyspace_name, KeyspaceKey},
+    keyspace::{
+        name::{is_reserved_keyspace_name, is_valid_keyspace_name},
+        KeyspaceKey,
+    },
     locked_file::LockedFileGuard,
     meta_keyspace::MetaKeyspace,
     poison::{PoisonDart, PoisonSignal},
@@ -438,7 +441,7 @@ impl Database {
         Ok(())
     }
 
-    fn allocate_keyspace_id(&self) -> crate::Result<u64> {
+    pub(crate) fn allocate_keyspace_id(&self) -> crate::Result<u64> {
         let mut keyspace_id = self.keyspace_id_counter.next();
 
         while self
@@ -509,16 +512,22 @@ impl Database {
     }
 
     /// Returns the number of keyspaces.
+    ///
+    /// Internal keyspaces (names starting with `__fjall`) are not counted.
     #[must_use]
     pub fn keyspace_count(&self) -> usize {
         self.supervisor
             .keyspaces
             .read()
             .expect("lock is poisoned")
-            .len()
+            .keys()
+            .filter(|name| !is_reserved_keyspace_name(name))
+            .count()
     }
 
     /// Gets a list of all keyspace names in the database.
+    ///
+    /// Internal keyspaces (names starting with `__fjall`) are not listed.
     #[must_use]
     pub fn list_keyspace_names(&self) -> Vec<KeyspaceKey> {
         self.supervisor
@@ -526,11 +535,14 @@ impl Database {
             .read()
             .expect("lock is poisoned")
             .keys()
+            .filter(|name| !is_reserved_keyspace_name(name))
             .cloned()
             .collect()
     }
 
     /// Returns `true` if the keyspace with the given name exists.
+    ///
+    /// Internal keyspaces (names starting with `__fjall`) are never reported as existing.
     ///
     /// # Examples
     ///
@@ -547,7 +559,7 @@ impl Database {
     /// ```
     #[must_use]
     pub fn keyspace_exists(&self, name: &str) -> bool {
-        self.meta_keyspace.keyspace_exists(name)
+        !is_reserved_keyspace_name(name) && self.meta_keyspace.keyspace_exists(name)
     }
 
     /// Gets the would-be-next sequence number.

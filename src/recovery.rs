@@ -8,7 +8,8 @@ use crate::{
         batch_reader::JournalBatchReader, manager::EvictionWatermark, reader::JournalReader,
     },
     keyspace::{
-        apply_to_base_config, options::CreateOptions as KeyspaceCreateOptions, InternalKeyspaceId,
+        apply_to_base_config, name::is_reserved_keyspace_name,
+        options::CreateOptions as KeyspaceCreateOptions, InternalKeyspaceId,
     },
     meta_keyspace::MetaKeyspace,
     Database, HashMap, Keyspace,
@@ -76,10 +77,13 @@ pub fn recover_keyspaces(db: &Database, meta_keyspace: &MetaKeyspace) -> crate::
         let mut recovered_config = KeyspaceCreateOptions::from_kvs(keyspace_id, &db.meta_keyspace)?;
 
         // Install compaction filter factory if needed
+        //
+        // NOTE: Internal keyspaces never get a user compaction filter
         if let Some(f) = db
             .config
             .compaction_filter_factory_assigner
             .as_ref()
+            .filter(|_| !is_reserved_keyspace_name(&keyspace_name))
             .and_then(|f| f(&keyspace_name))
         {
             recovered_config = recovered_config.with_compaction_filter_factory(f);
