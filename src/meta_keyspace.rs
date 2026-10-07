@@ -195,6 +195,11 @@ impl MetaKeyspace {
         Ok(())
     }
 
+    /// Returns the highest sequence number in the meta keyspace's tree.
+    pub(crate) fn highest_seqno(&self) -> Option<SeqNo> {
+        self.inner.get_highest_seqno()
+    }
+
     pub(crate) fn resolve_id(&self, id: InternalKeyspaceId) -> crate::Result<Option<StrView>> {
         #[expect(unsafe_code, clippy::indexing_slicing)]
         let key = {
@@ -447,6 +452,30 @@ mod tests {
             let _db = Database::builder(&folder).open()?;
             assert!(!path.try_exists()?);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn seqno_counter_is_restored_past_meta_keyspace() -> crate::Result<()> {
+        use crate::AbstractTree;
+
+        let folder = tempfile::tempdir()?;
+        {
+            let db = Database::builder(&folder).open()?;
+            let a = db.keyspace("a", KeyspaceCreateOptions::default)?;
+            a.insert("k", "v")?;
+            let b = db.keyspace("b", KeyspaceCreateOptions::default)?;
+            db.delete_keyspace(b)?;
+        }
+
+        let db = Database::builder(&folder).open()?;
+        let highest = db
+            .meta_keyspace
+            .inner
+            .get_highest_seqno()
+            .expect("meta keyspace has entries");
+        assert!(db.supervisor.seqno.get() > highest);
 
         Ok(())
     }

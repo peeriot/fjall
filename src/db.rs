@@ -793,6 +793,24 @@ impl Database {
             }
         }
 
+        // IMPORTANT: The meta keyspace shares the global sequence counter, and trees may hold
+        // flushed data without an active journal, so restore the counter from every tree
+        {
+            #[expect(clippy::expect_used)]
+            let keyspaces = db.supervisor.keyspaces.read().expect("lock is poisoned");
+
+            let highest_seqno = keyspaces
+                .values()
+                .filter_map(|keyspace| keyspace.tree.get_highest_seqno())
+                .chain(db.meta_keyspace.highest_seqno())
+                .max();
+
+            if let Some(highest_seqno) = highest_seqno {
+                db.supervisor.seqno.fetch_max(highest_seqno + 1);
+                log::debug!("Database seqno is now {}", db.supervisor.seqno.get());
+            }
+        }
+
         db.supervisor
             .snapshot_tracker
             .set(db.supervisor.seqno.get());
