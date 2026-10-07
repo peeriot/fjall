@@ -17,7 +17,8 @@ fn lost_reserved_keyspace_fails_every_2pc_call() -> fjall::Result<()> {
     }
     std::fs::remove_dir_all(folder.path().join("keyspaces").join("2"))?;
 
-    // Create no keyspace before the 2PC calls: it would be handed id 2.
+    // NOTE: A keyspace created here would not be handed the lost id 2, which the
+    // meta keyspace still maps (`lost_reserved_keyspace_id_is_not_reissued`)
     let db = OptimisticTxDatabase::builder(&folder).open()?;
     let a = db.keyspace("a", KeyspaceCreateOptions::default)?;
     assert!(matches!(

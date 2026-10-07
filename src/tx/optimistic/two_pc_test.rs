@@ -381,6 +381,75 @@ fn undecodable_row_does_not_fail_open() -> crate::Result<()> {
     Ok(())
 }
 
+/// Seals the active journal and deletes every journal whose writes are all flushed.
+fn evict_journals(db: &OptimisticTxDatabase) -> crate::Result<()> {
+    let supervisor = &db.inner().supervisor;
+    let mut writer = supervisor.journal.get_writer()?;
+    let seqno_map = {
+        let keyspaces = supervisor.keyspaces.write().expect("lock is poisoned");
+        supervisor.build_seqno_map(&keyspaces)
+    };
+    let mut manager = supervisor
+        .journal_manager
+        .write()
+        .expect("lock is poisoned");
+    manager.rotate_journal(&mut writer, seqno_map)?;
+    drop(writer);
+    manager.maintenance()
+}
+
+#[test]
+fn lost_reserved_keyspace_id_is_not_reissued() -> crate::Result<()> {
+    // §5 lost-keyspace check: once the prepare's journal is evicted, only the meta
+    // keyspace still knows the lost keyspace's id
+    let folder = tempfile::tempdir()?;
+    let txn_id = {
+        let db = open(&folder)?;
+        let a = keyspace(&db, "a")?;
+        prepare_one(&db, &a, "x", "k", "v")?;
+        let txn = db.inner().reserved_keyspace()?.expect("created");
+        txn.rotate_memtable_and_wait()?;
+        evict_journals(&db)?;
+        assert_eq!(1, db.journal_count(), "the prepare's journal was evicted");
+        txn.id()
+    };
+    std::fs::remove_dir_all(folder.path().join("keyspaces").join(txn_id.to_string()))?;
+
+    let db = open(&folder)?;
+    let c = keyspace(&db, "c")?;
+    assert_ne!(txn_id, c.inner().id());
+
+    let mut tx = db.write_tx()?;
+    tx.insert(&c, "k", "v");
+    assert!(matches!(tx.prepare("y"), Err(crate::Error::Unrecoverable)));
+    assert!(matches!(
+        db.write_tx()?.prepare("z"),
+        Err(crate::Error::Unrecoverable)
+    ));
+    assert!(matches!(
+        db.commit_prepared("x"),
+        Err(crate::Error::Unrecoverable)
+    ));
+    assert!(matches!(
+        db.rollback_prepared("x"),
+        Err(crate::Error::Unrecoverable)
+    ));
+    assert!(matches!(
+        db.pending_prepared(),
+        Err(crate::Error::Unrecoverable)
+    ));
+    assert!(matches!(
+        db.prepared_items("x"),
+        Err(crate::Error::Unrecoverable)
+    ));
+
+    let mut tx = db.write_tx()?;
+    tx.insert(&c, "k", "v");
+    assert!(tx.commit()?.is_ok());
+    assert_eq!(Some("v".as_bytes().into()), c.get("k")?);
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Fault {
     JournalWrite,

@@ -441,6 +441,11 @@ impl Database {
         Ok(())
     }
 
+    /// Allocates an id that has neither a keyspace directory nor a name mapping.
+    ///
+    /// A mapped id whose directory is gone belongs to a lost keyspace; reissuing it
+    /// would overwrite the mapping that the lost-keyspace check of the reserved
+    /// keyspace relies on.
     pub(crate) fn allocate_keyspace_id(&self) -> crate::Result<u64> {
         let mut keyspace_id = self.keyspace_id_counter.next();
 
@@ -450,6 +455,7 @@ impl Database {
             .join(KEYSPACES_FOLDER)
             .join(keyspace_id.to_string())
             .try_exists()?
+            || self.meta_keyspace.resolve_id(keyspace_id)?.is_some()
         {
             keyspace_id = self.keyspace_id_counter.next()
         }
