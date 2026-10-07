@@ -614,12 +614,12 @@ impl Database {
         let journal_manager = JournalManager::new();
 
         let seqno = SequenceNumberCounter::default();
-        let visible_seqno = SequenceNumberCounter::default();
+        let snapshot_tracker = SnapshotTracker::new(SequenceNumberCounter::default());
 
         let meta_tree = lsm_tree::Config::new(
             config.path.join(KEYSPACES_FOLDER).join("0"),
             seqno.clone(),
-            visible_seqno.clone(),
+            snapshot_tracker.install_counter(),
         )
         .use_cache(config.cache.clone())
         .use_descriptor_table(config.descriptor_table.clone())
@@ -641,19 +641,14 @@ impl Database {
 
         let keyspaces = Arc::new(RwLock::default());
 
-        let meta_keyspace = MetaKeyspace::new(
-            meta_tree,
-            keyspaces.clone(),
-            seqno.clone(),
-            visible_seqno.clone(),
-        );
+        let meta_keyspace = MetaKeyspace::new(meta_tree, keyspaces.clone());
 
         let supervisor = Supervisor::new(SupervisorInner {
             db_config: config.clone(),
             keyspaces,
             flush_manager: FlushManager::new(),
             write_buffer_size: WriteBufferManager::default(),
-            snapshot_tracker: SnapshotTracker::new(visible_seqno),
+            snapshot_tracker,
             journal: active_journal,
             journal_manager: Arc::new(RwLock::new(journal_manager)),
             backpressure_lock: Mutex::default(),
@@ -897,12 +892,12 @@ impl Database {
         fsync_directory(&config.path)?;
 
         let seqno = SequenceNumberCounter::default();
-        let visible_seqno = SequenceNumberCounter::default();
+        let snapshot_tracker = SnapshotTracker::new(SequenceNumberCounter::default());
 
         let meta_tree = lsm_tree::Config::new(
             config.path.join(KEYSPACES_FOLDER).join("0"),
             seqno.clone(),
-            visible_seqno.clone(),
+            snapshot_tracker.install_counter(),
         )
         .use_cache(config.cache.clone())
         .use_descriptor_table(config.descriptor_table.clone())
@@ -924,19 +919,14 @@ impl Database {
 
         let keyspaces = Arc::new(RwLock::default());
 
-        let meta_keyspace = MetaKeyspace::new(
-            meta_tree,
-            keyspaces.clone(),
-            seqno.clone(),
-            visible_seqno.clone(),
-        );
+        let meta_keyspace = MetaKeyspace::new(meta_tree, keyspaces.clone());
 
         let supervisor = Supervisor::new(SupervisorInner {
             db_config: config.clone(),
             keyspaces,
             flush_manager: FlushManager::new(),
             write_buffer_size: WriteBufferManager::default(),
-            snapshot_tracker: SnapshotTracker::new(visible_seqno),
+            snapshot_tracker,
             journal,
             journal_manager: Arc::new(RwLock::new(JournalManager::new())),
             backpressure_lock: Mutex::default(),

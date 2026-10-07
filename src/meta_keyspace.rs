@@ -4,7 +4,7 @@
 
 use crate::{db::Keyspaces, keyspace::InternalKeyspaceId, Keyspace};
 use byteview::StrView;
-use lsm_tree::{AbstractTree, AnyTree, SeqNo, SequenceNumberCounter, UserValue};
+use lsm_tree::{AbstractTree, AnyTree, SeqNo, UserValue};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 pub fn encode_config_key(keyspace_id: InternalKeyspaceId, name: &str) -> crate::UserKey {
@@ -51,24 +51,11 @@ pub struct MetaKeyspace {
     /// Dictionary of all keyspaces
     #[doc(hidden)]
     pub keyspaces: Arc<RwLock<Keyspaces>>,
-
-    seqno_generator: SequenceNumberCounter,
-    visible_seqno: SequenceNumberCounter,
 }
 
 impl MetaKeyspace {
-    pub(crate) fn new(
-        inner: AnyTree,
-        keyspaces: Arc<RwLock<Keyspaces>>,
-        seqno_generator: SequenceNumberCounter,
-        visible_seqno: SequenceNumberCounter,
-    ) -> Self {
-        Self {
-            inner,
-            keyspaces,
-            seqno_generator,
-            visible_seqno,
-        }
+    pub(crate) fn new(inner: AnyTree, keyspaces: Arc<RwLock<Keyspaces>>) -> Self {
+        Self { inner, keyspaces }
     }
 
     #[cfg(test)]
@@ -154,8 +141,6 @@ impl MetaKeyspace {
             return Ok(());
         };
 
-        let seqno = self.seqno_generator.next();
-
         let mut ingestion = self.inner.ingestion()?;
         {
             // Remove all config KVs
@@ -181,8 +166,6 @@ impl MetaKeyspace {
             ingestion.write_tombstone(key)?;
         }
         ingestion.finish()?;
-
-        self.visible_seqno.fetch_max(seqno + 1);
 
         lock.remove(name);
 

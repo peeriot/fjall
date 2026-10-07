@@ -266,7 +266,9 @@ impl Keyspace {
             self.is_poisoned.poison();
         })?;
 
-        self.supervisor.snapshot_tracker.publish(seqno);
+        self.supervisor
+            .snapshot_tracker
+            .publish(&journal_writer, seqno);
 
         drop(journal_writer);
 
@@ -344,7 +346,7 @@ impl Keyspace {
         let base_config = lsm_tree::Config::new(
             base_folder,
             db.supervisor.seqno.clone(),
-            db.supervisor.snapshot_tracker.get_ref(),
+            db.supervisor.snapshot_tracker.install_counter(),
         )
         .use_descriptor_table(db.config.descriptor_table.clone())
         .use_cache(db.config.cache.clone());
@@ -949,7 +951,9 @@ impl Keyspace {
 
         let (item_size, memtable_size) = self.tree.insert(key, value, seqno);
 
-        self.supervisor.snapshot_tracker.publish(seqno);
+        self.supervisor
+            .snapshot_tracker
+            .publish(&journal_writer, seqno);
 
         drop(journal_writer);
 
@@ -1023,7 +1027,9 @@ impl Keyspace {
 
         let (item_size, memtable_size) = self.tree.remove(key, seqno);
 
-        self.supervisor.snapshot_tracker.publish(seqno);
+        self.supervisor
+            .snapshot_tracker
+            .publish(&journal_writer, seqno);
 
         drop(journal_writer);
 
@@ -1117,7 +1123,9 @@ impl Keyspace {
 
         let (item_size, memtable_size) = self.tree.remove(key, seqno);
 
-        self.supervisor.snapshot_tracker.publish(seqno);
+        self.supervisor
+            .snapshot_tracker
+            .publish(&journal_writer, seqno);
 
         drop(journal_writer);
 

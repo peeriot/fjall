@@ -49,18 +49,28 @@ impl<'a> Ingestion<'a> {
         // -----------------
         // |
         // insert seqno=1
-        let _journal_lock = self.keyspace.supervisor.journal.get_writer();
+        //
+        // The lock is held across the whole of `finish`, so the install is
+        // published before any other write can run.
+        let journal_lock = self.keyspace.supervisor.journal.get_writer()?;
 
-        self.inner
-            .finish()
-            .inspect(|()| {
-                self.keyspace
-                    .worker_messager
-                    .try_send(WorkerMessage::Compact(self.keyspace.clone()))
-                    .ok();
+        self.inner.finish()?;
 
-                self.keyspace.supervisor.snapshot_tracker.gc();
-            })
-            .map_err(Into::into)
+        // IMPORTANT: Make the ingested data visible to new snapshots before releasing the lock
+        self.keyspace
+            .supervisor
+            .snapshot_tracker
+            .publish_installs(&journal_lock);
+
+        self.keyspace
+            .worker_messager
+            .try_send(WorkerMessage::Compact(self.keyspace.clone()))
+            .ok();
+
+        self.keyspace.supervisor.snapshot_tracker.gc();
+
+        drop(journal_lock);
+
+        Ok(())
     }
 }

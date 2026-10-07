@@ -7,9 +7,24 @@ use dashmap::DashMap;
 use lsm_tree::SequenceNumberCounter;
 use std::sync::{atomic::AtomicU64, Arc, RwLock};
 
+/// Proof that the caller holds the journal lock.
+pub trait HoldsJournalLock {}
+
+impl HoldsJournalLock for std::sync::MutexGuard<'_, crate::journal::writer::Writer> {}
+
 /// Keeps track of open snapshots
 pub struct SnapshotTrackerInner {
+    /// The visible counter: snapshots read at its value
+    ///
+    /// Only advanced while the journal lock is held (or during recovery), so no
+    /// half-applied write is ever visible.
     seqno: SequenceNumberCounter,
+
+    /// The install counter: handed to every tree, which raises it on each version install
+    ///
+    /// Folded into the visible counter by [`SnapshotTracker::publish`] and
+    /// [`SnapshotTracker::publish_installs`].
+    installs: SequenceNumberCounter,
 
     gc_lock: RwLock<()>,
 
@@ -39,12 +54,14 @@ impl SnapshotTracker {
             freed_count: AtomicU64::default(),
             lowest_freed_instant: AtomicU64::default(),
             seqno,
+            installs: SequenceNumberCounter::default(),
             gc_lock: RwLock::default(),
         }))
     }
 
-    pub fn get_ref(&self) -> SequenceNumberCounter {
-        self.seqno.clone()
+    /// The counter handed to every tree; trees raise it on each version install.
+    pub fn install_counter(&self) -> SequenceNumberCounter {
+        self.installs.clone()
     }
 
     /// Used in database recovery.
@@ -121,9 +138,15 @@ impl SnapshotTracker {
         }
     }
 
-    /// Publish write completion
-    pub fn publish(&self, batch_seqno: SeqNo) {
-        self.seqno.fetch_max(batch_seqno + 1);
+    /// Publish write completion, and every version install recorded so far
+    pub fn publish(&self, _lock: &impl HoldsJournalLock, batch_seqno: SeqNo) {
+        self.seqno
+            .fetch_max((batch_seqno + 1).max(self.installs.get()));
+    }
+
+    /// Publish every version install recorded so far
+    pub fn publish_installs(&self, _lock: &impl HoldsJournalLock) {
+        self.seqno.fetch_max(self.installs.get());
     }
 
     // TODO: after recovery, we may need to set the GC watermark once to current_seqno - 1
@@ -184,6 +207,9 @@ impl SnapshotTracker {
 mod tests {
     use super::*;
     use test_log::test;
+
+    struct Held;
+    impl HoldsJournalLock for Held {}
 
     #[test]
     fn snapshot_tracker_mvcc_watermark_1() -> crate::Result<()> {
@@ -375,11 +401,11 @@ mod tests {
         let map = SnapshotTracker::new(global_seqno);
 
         let big = 100u64;
-        map.publish(big);
+        map.publish(&Held, big);
         assert!(map.get() == (big + 1));
 
         let before = map.get();
-        map.publish(1);
+        map.publish(&Held, 1);
         assert_eq!(map.get(), before);
     }
 
@@ -401,5 +427,33 @@ mod tests {
         // closing the clone removes all
         map.close(&clone);
         assert_eq!(map.open_snapshots(), 0);
+    }
+    #[test]
+    fn snapshot_tracker_installs_do_not_move_visible() {
+        let map = SnapshotTracker::new(SequenceNumberCounter::default());
+        map.install_counter().fetch_max(10);
+        assert_eq!(0, map.get());
+        assert_eq!(0, map.open().instant);
+    }
+
+    #[test]
+    fn snapshot_tracker_publish_folds_installs() {
+        let map = SnapshotTracker::new(SequenceNumberCounter::default());
+        map.install_counter().fetch_max(10);
+        map.publish(&Held, 3);
+        assert_eq!(10, map.get());
+        map.publish(&Held, 20);
+        assert_eq!(21, map.get());
+    }
+
+    #[test]
+    fn snapshot_tracker_publish_installs() {
+        let map = SnapshotTracker::new(SequenceNumberCounter::default());
+        map.publish(&Held, 4);
+        map.install_counter().fetch_max(7);
+        map.publish_installs(&Held);
+        assert_eq!(7, map.get());
+        map.publish_installs(&Held);
+        assert_eq!(7, map.get());
     }
 }

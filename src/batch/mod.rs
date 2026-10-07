@@ -161,7 +161,10 @@ impl WriteBatch {
             keyspaces_with_possible_stall.insert(item.keyspace.clone());
         }
 
-        self.db.supervisor.snapshot_tracker.publish(batch_seqno);
+        self.db
+            .supervisor
+            .snapshot_tracker
+            .publish(&journal_writer, batch_seqno);
 
         drop(journal_writer);
 

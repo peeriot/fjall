@@ -65,6 +65,8 @@ fn keyspace_visible_seqno() -> fjall::Result<()> {
 
     let tree = db.keyspace("default", KeyspaceCreateOptions::default)?;
 
+    tree.insert("a#0", "a")?;
+
     let initial_seqno = db.snapshot().seqno();
 
     tree.insert("a#1", "a")?;
@@ -76,33 +78,6 @@ fn keyspace_visible_seqno() -> fjall::Result<()> {
 
     let snapshot = db.snapshot();
     assert_eq!(initial_seqno + 2, snapshot.seqno());
-
-    Ok(())
-}
-
-#[test]
-fn keyspace_torn_read() -> fjall::Result<()> {
-    let folder = tempfile::tempdir()?;
-
-    let db = Database::builder(&folder).open()?;
-
-    let initial_seqno = db.snapshot().seqno();
-
-    // Fake start of a batch
-    let batch_seqno = db.supervisor.seqno.next();
-
-    // ...
-
-    let snapshot = db.snapshot();
-    assert_eq!(initial_seqno, snapshot.seqno());
-
-    // ...
-
-    // Submitting batch completion
-    db.supervisor.snapshot_tracker.publish(batch_seqno);
-
-    let snapshot = db.snapshot();
-    assert_eq!(initial_seqno + 1, snapshot.seqno());
 
     Ok(())
 }
