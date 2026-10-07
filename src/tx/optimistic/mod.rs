@@ -5,6 +5,7 @@
 mod conflict_manager;
 mod keyspace;
 mod oracle;
+pub mod two_pc;
 mod write_tx;
 
 use crate::{
@@ -18,6 +19,7 @@ use std::{
 };
 
 pub use keyspace::OptimisticTxKeyspace;
+pub use two_pc::PreparedItemKind;
 pub use write_tx::{Conflict, UntrackedWriteTransaction, WriteTransaction};
 
 /// Transactional database

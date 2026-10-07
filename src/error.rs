@@ -48,6 +48,15 @@ pub enum Error {
 
     /// Database is unrecoverable, see logs for details
     Unrecoverable,
+
+    /// `prepare` was called with an xid that is currently prepared and unresolved
+    XidInUse,
+
+    /// A write touched a key frozen by a pending prepare; retry after it resolves
+    PreparedConflict,
+
+    /// A write-set item exceeds the size limits of a prepared row
+    PreparedItemTooLarge,
 }
 
 impl std::fmt::Display for Error {
