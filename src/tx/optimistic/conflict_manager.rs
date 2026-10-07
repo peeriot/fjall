@@ -76,6 +76,37 @@ impl ConflictManager {
         self.push_read(keyspace_id, read);
     }
 
+    /// Returns `true` if `self` and `other` wrote the same key in the same keyspace.
+    ///
+    /// Only the conflict keys (writes) of both sides are compared; reads are ignored.
+    ///
+    /// Locks both sides' conflict keys at once, so it is only called while holding the
+    /// oracle lock.
+    pub fn has_write_overlap(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            #[expect(clippy::expect_used)]
+            let lock = self.conflict_keys.lock().expect("lock is poisoned");
+            return lock.values().any(|keys| !keys.is_empty());
+        }
+
+        #[expect(clippy::expect_used)]
+        let own_keys = self.conflict_keys.lock().expect("lock is poisoned");
+
+        #[expect(clippy::expect_used)]
+        let other_keys = other.conflict_keys.lock().expect("lock is poisoned");
+
+        own_keys.iter().any(|(keyspace_id, keys)| {
+            other_keys.get(keyspace_id).is_some_and(|other_keys| {
+                let (smaller, larger) = if keys.len() <= other_keys.len() {
+                    (keys, other_keys)
+                } else {
+                    (other_keys, keys)
+                };
+                smaller.iter().any(|key| larger.contains(key))
+            })
+        })
+    }
+
     #[expect(clippy::too_many_lines, clippy::significant_drop_tightening)]
     pub fn has_conflict(&self, other: &Self) -> bool {
         #[expect(clippy::expect_used)]
@@ -193,5 +224,27 @@ impl ConflictManager {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConflictManager;
+
+    #[test]
+    fn write_overlap_is_per_keyspace() {
+        let a = ConflictManager::default();
+        a.mark_conflict(1, "k".into());
+        let b = ConflictManager::default();
+        b.mark_conflict(2, "k".into());
+        assert!(!a.has_write_overlap(&b));
+
+        b.mark_conflict(1, "k".into());
+        assert!(a.has_write_overlap(&b));
+        assert!(b.has_write_overlap(&a));
+
+        let reader = ConflictManager::default();
+        reader.mark_read(1, "k".into());
+        assert!(!reader.has_write_overlap(&a));
     }
 }

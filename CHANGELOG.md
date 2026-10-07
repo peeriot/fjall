@@ -1,3 +1,8 @@
+# Unreleased
+
+- [api] `OptimisticTxKeyspace::insert`, `remove` and `remove_weak` return `Error::PreparedConflict` instead of panicking when a pending prepare froze the key
+- [api] `OptimisticTxKeyspace::fetch_update`, `update_fetch` and `take` return `Error::PreparedConflict` instead of retrying forever when a pending prepare froze the key
+
 # 3.1.0
 
 - [feat] Implemented support for compaction filters (custom logic during compactions)

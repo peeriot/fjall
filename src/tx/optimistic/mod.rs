@@ -53,6 +53,11 @@ impl OptimisticTxDatabase {
         crate::DatabaseBuilder::new(path.as_ref())
     }
 
+    /// Allows access to the inner database, allowing to
+    /// escape from the transactional context.
+    ///
+    /// Writes through this handle bypass conflict detection, including the keys
+    /// frozen by pending prepares.
     #[doc(hidden)]
     #[must_use]
     pub fn inner(&self) -> &Database {

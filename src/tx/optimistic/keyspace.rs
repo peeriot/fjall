@@ -2,7 +2,10 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::{tx::optimistic::OptimisticTxDatabase, Keyspace};
+use crate::{
+    tx::optimistic::{oracle::ConflictSource, OptimisticTxDatabase},
+    Keyspace,
+};
 use crate::{Guard, Readable};
 use lsm_tree::{UserKey, UserValue};
 use std::path::PathBuf;
@@ -84,6 +87,9 @@ impl OptimisticTxKeyspace {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
+    ///
+    /// Returns `Error::PreparedConflict` if the key is frozen by a pending prepare
+    /// (two-phase commit); retry after it is resolved.
     pub fn take<K: Into<UserKey>>(&self, key: K) -> crate::Result<Option<UserValue>> {
         self.fetch_update(key, |_| None)
     }
@@ -99,6 +105,10 @@ impl OptimisticTxKeyspace {
     /// The provided closure can be called multiple times as this function
     /// automatically retries on conflict. Since this is an `FnMut`, make sure
     /// it is idempotent and will not cause side-effects.
+    ///
+    /// It does not retry if the key is frozen by a pending prepare (two-phase commit):
+    /// that conflict lasts until the prepared transaction is resolved, so it returns
+    /// `Error::PreparedConflict` instead.
     ///
     /// # Examples
     ///
@@ -141,6 +151,9 @@ impl OptimisticTxKeyspace {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
+    ///
+    /// Returns `Error::PreparedConflict` if the key is frozen by a pending prepare
+    /// (two-phase commit); retry after it is resolved.
     pub fn fetch_update<K: Into<UserKey>, F: FnMut(Option<&UserValue>) -> Option<UserValue>>(
         &self,
         key: K,
@@ -151,8 +164,10 @@ impl OptimisticTxKeyspace {
         loop {
             let mut tx = self.db.write_tx()?;
             let prev = tx.fetch_update(self.inner(), key.clone(), &mut f)?;
-            if tx.commit()?.is_ok() {
-                return Ok(prev);
+            match tx.try_commit()? {
+                Ok(()) => return Ok(prev),
+                Err(ConflictSource::Ssi) => {}
+                Err(ConflictSource::Reservation) => return Err(crate::Error::PreparedConflict),
             }
         }
     }
@@ -168,6 +183,10 @@ impl OptimisticTxKeyspace {
     /// The provided closure can be called multiple times as this function
     /// automatically retries on conflict. Since this is an `FnMut`, make sure
     /// it is idempotent and will not cause side-effects.
+    ///
+    /// It does not retry if the key is frozen by a pending prepare (two-phase commit):
+    /// that conflict lasts until the prepared transaction is resolved, so it returns
+    /// `Error::PreparedConflict` instead.
     ///
     /// # Examples
     ///
@@ -210,6 +229,9 @@ impl OptimisticTxKeyspace {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
+    ///
+    /// Returns `Error::PreparedConflict` if the key is frozen by a pending prepare
+    /// (two-phase commit); retry after it is resolved.
     pub fn update_fetch<K: Into<UserKey>, F: FnMut(Option<&UserValue>) -> Option<UserValue>>(
         &self,
         key: K,
@@ -220,8 +242,10 @@ impl OptimisticTxKeyspace {
         loop {
             let mut tx = self.db.write_tx()?;
             let updated = tx.update_fetch(self.inner(), key.clone(), &mut f)?;
-            if tx.commit()?.is_ok() {
-                return Ok(updated);
+            match tx.try_commit()? {
+                Ok(()) => return Ok(updated),
+                Err(ConflictSource::Ssi) => {}
+                Err(ConflictSource::Reservation) => return Err(crate::Error::PreparedConflict),
             }
         }
     }
@@ -253,6 +277,9 @@ impl OptimisticTxKeyspace {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
+    ///
+    /// Returns `Error::PreparedConflict` if the key is frozen by a pending prepare
+    /// (two-phase commit); retry after it is resolved.
     pub fn insert<K: Into<UserKey>, V: Into<UserValue>>(
         &self,
         key: K,
@@ -260,15 +287,7 @@ impl OptimisticTxKeyspace {
     ) -> crate::Result<()> {
         let mut tx = self.db.write_tx()?;
         tx.insert(self.inner(), key, value);
-
-        #[expect(
-            clippy::expect_used,
-            clippy::missing_panics_doc,
-            reason = "blind insert should not conflict ever"
-        )]
-        tx.commit()?.expect("blind insert should not conflict ever");
-
-        Ok(())
+        blind_write_outcome(tx.try_commit()?)
     }
 
     /// Removes an item from the keyspace.
@@ -298,18 +317,13 @@ impl OptimisticTxKeyspace {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
+    ///
+    /// Returns `Error::PreparedConflict` if the key is frozen by a pending prepare
+    /// (two-phase commit); retry after it is resolved.
     pub fn remove<K: Into<UserKey>>(&self, key: K) -> crate::Result<()> {
         let mut tx = self.db.write_tx()?;
         tx.remove(self.inner(), key);
-
-        #[expect(
-            clippy::expect_used,
-            clippy::missing_panics_doc,
-            reason = "blind remove should not conflict ever"
-        )]
-        tx.commit()?.expect("blind remove should not conflict ever");
-
-        Ok(())
+        blind_write_outcome(tx.try_commit()?)
     }
 
     /// Removes an item from the keyspace, leaving behind a weak tombstone.
@@ -348,15 +362,14 @@ impl OptimisticTxKeyspace {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
+    ///
+    /// Returns `Error::PreparedConflict` if the key is frozen by a pending prepare
+    /// (two-phase commit); retry after it is resolved.
     #[doc(hidden)]
     pub fn remove_weak<K: Into<UserKey>>(&self, key: K) -> crate::Result<()> {
         let mut tx = self.db.write_tx()?;
         tx.remove_weak(self.inner(), key);
-
-        #[expect(clippy::expect_used)]
-        tx.commit()?.expect("blind remove should not conflict ever");
-
-        Ok(())
+        blind_write_outcome(tx.try_commit()?)
     }
 
     /// Retrieves an item from the keyspace.
@@ -494,9 +507,24 @@ impl OptimisticTxKeyspace {
 
     /// Allows access to the inner keyspace handle, allowing to
     /// escape from the transactional context.
+    ///
+    /// Writes through this handle bypass conflict detection, including the keys
+    /// frozen by pending prepares.
     #[doc(hidden)]
     #[must_use]
     pub fn inner(&self) -> &Keyspace {
         &self.inner
+    }
+}
+
+/// Maps the commit outcome of a blind write (one without reads).
+///
+/// A transaction without reads cannot conflict with a committed transaction,
+/// only with the write-set of a pending prepare.
+fn blind_write_outcome(outcome: Result<(), ConflictSource>) -> crate::Result<()> {
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(ConflictSource::Reservation) => Err(crate::Error::PreparedConflict),
+        Err(ConflictSource::Ssi) => unreachable!("a blind write has no read set"),
     }
 }

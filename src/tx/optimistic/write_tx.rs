@@ -7,7 +7,7 @@ use crate::{
     tx::{
         optimistic::{
             conflict_manager::ConflictManager,
-            oracle::{CommitOutcome, Oracle},
+            oracle::{CommitOutcome, ConflictSource, Oracle},
         },
         write_tx::BaseTransaction,
     },
@@ -446,6 +446,11 @@ impl WriteTransaction {
     ///
     /// Will return `Err` if an IO error occurs.
     pub fn commit(self) -> crate::Result<Result<(), Conflict>> {
+        Ok(self.try_commit()?.map_err(|_| Conflict))
+    }
+
+    /// Commits the transaction, reporting why it conflicted if it did.
+    pub(super) fn try_commit(self) -> crate::Result<Result<(), ConflictSource>> {
         // NOTE: We have no write set, so we are basically
         // a read-only transaction, so nothing to do here
         if self.inner.memtables.is_empty() {
@@ -459,7 +464,8 @@ impl WriteTransaction {
         })? {
             CommitOutcome::Ok => Ok(Ok(())),
             CommitOutcome::Aborted(e) => Err(e),
-            CommitOutcome::Conflicted => Ok(Err(Conflict)),
+            CommitOutcome::Conflicted => Ok(Err(ConflictSource::Ssi)),
+            CommitOutcome::ReservationConflicted => Ok(Err(ConflictSource::Reservation)),
         }
     }
 
