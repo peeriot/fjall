@@ -357,3 +357,22 @@ fn reused_xid_after_resolution_is_a_new_generation() -> crate::Result<()> {
     assert_eq!(Resolution::NoOp, db.commit_prepared("x")?);
     Ok(())
 }
+
+#[test]
+fn undecodable_row_does_not_fail_open() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    {
+        let db = open(&folder)?;
+        let a = keyspace(&db, "a")?;
+        prepare_one(&db, &a, "x", "k", "v")?;
+        let txn = db.inner().reserved_keyspace()?.expect("created");
+        txn.insert([0xFFu8], "junk")?; // too short for its own layout
+    }
+    let db = open(&folder)?; // logs the row, does not fail
+    assert!(matches!(
+        db.pending_prepared(),
+        Err(crate::Error::Unrecoverable)
+    ));
+    assert_eq!(1, db.prepared_items("x")?.len());
+    Ok(())
+}

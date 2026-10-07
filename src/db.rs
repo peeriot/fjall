@@ -9,7 +9,7 @@ use crate::{
     flush::manager::FlushManager,
     journal::{manager::JournalManager, writer::PersistMode, Journal},
     keyspace::{
-        name::{is_reserved_keyspace_name, is_valid_keyspace_name},
+        name::{is_reserved_keyspace_name, is_valid_keyspace_name, TXN_KEYSPACE_NAME},
         KeyspaceKey,
     },
     locked_file::LockedFileGuard,
@@ -20,7 +20,7 @@ use crate::{
     snapshot_tracker::SnapshotTracker,
     stats::Stats,
     supervisor::{Supervisor, SupervisorInner},
-    tx::single_writer::Openable,
+    tx::{optimistic::two_pc::max_target_keyspace_id, single_writer::Openable},
     version::FormatVersion,
     worker_pool::{WorkerMessage, WorkerPool},
     write_buffer_manager::WriteBufferManager,
@@ -818,6 +818,34 @@ impl Database {
             if let Some(highest_seqno) = highest_seqno {
                 db.supervisor.seqno.fetch_max(highest_seqno + 1);
                 log::debug!("Database seqno is now {}", db.supervisor.seqno.get());
+            }
+        }
+
+        // IMPORTANT: Prepared rows name their target keyspaces by id, and neither the
+        // directories nor the journal show a deleted target, so raise the keyspace id
+        // counter past every target id, or a new keyspace could take a deleted target's id
+        //
+        // NOTE: A map lookup only, so a database that never prepared does no extra I/O
+        {
+            #[expect(clippy::expect_used)]
+            let txn = db
+                .supervisor
+                .keyspaces
+                .read()
+                .expect("lock is poisoned")
+                .get(TXN_KEYSPACE_NAME)
+                .cloned();
+
+            if let Some(txn) = txn {
+                if let Some(max_target_id) = max_target_keyspace_id(&txn)? {
+                    db.keyspace_id_counter
+                        .fetch_max(max_target_id.saturating_add(1));
+
+                    log::debug!(
+                        "Keyspace id counter is now {} (prepared transactions)",
+                        db.keyspace_id_counter.get(),
+                    );
+                }
             }
         }
 

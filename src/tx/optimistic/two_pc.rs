@@ -11,8 +11,6 @@
 //! value = format version (u8) ‖ operation tag (u8) ‖ user value
 //! ```
 
-#![cfg_attr(not(test), allow(dead_code, reason = "wired up by Tasks 5-8"))]
-
 use crate::{
     keyspace::{InternalKeyspaceId, KeyspaceKey},
     worker_pool::WorkerMessage,
@@ -389,6 +387,32 @@ pub fn request_compaction(txn: &Keyspace) {
     txn.worker_messager
         .try_send(WorkerMessage::Compact(txn.clone()))
         .ok();
+}
+
+/// Highest target keyspace id of any live row, read at `SeqNo::MAX` from memtables
+/// and tables.
+///
+/// A row whose key cannot be decoded is logged at error level and skipped: it can
+/// never be applied, and failing here would make the database unopenable.
+///
+/// # Errors
+///
+/// Returns an error if an I/O error occurred.
+pub fn max_target_keyspace_id(txn: &Keyspace) -> crate::Result<Option<InternalKeyspaceId>> {
+    let mut max_id = None;
+
+    for guard in txn.tree.iter(SeqNo::MAX, None) {
+        let row_key = guard.key()?;
+
+        match decode_row_key(&row_key) {
+            Ok(key) => max_id = max_id.max(Some(key.keyspace_id)),
+            Err(_) => log::error!(
+                "Skipping undecodable row in the prepared transactions keyspace (key={row_key:?})",
+            ),
+        }
+    }
+
+    Ok(max_id)
 }
 
 /// Maps the error of a failed 2PC batch commit to `Error::Poisoned` if the database
