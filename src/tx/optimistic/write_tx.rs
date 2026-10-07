@@ -487,6 +487,11 @@ impl WriteTransaction {
     ///
     /// The transaction is consumed either way.
     ///
+    /// An xid must never be reused; make it globally unique for all time (e.g.
+    /// global transaction id, branch qualifier and coordinator epoch). Resolution
+    /// calls carry no generation, so a delayed resolution call from an earlier use
+    /// of the xid would resolve the current prepare instead, unnoticed.
+    ///
     /// The first non-empty prepare in a database's lifetime also creates the
     /// hidden keyspace that holds prepared write-sets; it is slower than
     /// later ones by one keyspace creation.

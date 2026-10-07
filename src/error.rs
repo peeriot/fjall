@@ -50,6 +50,11 @@ pub enum Error {
     Unrecoverable,
 
     /// `prepare` was called with an xid that is currently prepared and unresolved
+    ///
+    /// As xids are never reused, a coordinator meets this only when it retries its
+    /// own prepare after a lost reply. It then means that the earlier attempt is
+    /// durably prepared: treat it as a YES vote for that attempt's write-set (branch
+    /// re-execution must be deterministic, or verify it with `prepared_items`).
     XidInUse,
 
     /// A write touched a key frozen by a pending prepare; retry after it resolves
