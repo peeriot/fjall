@@ -34,3 +34,39 @@ fn recycled_keyspace_id_survives_reopen() -> fjall::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn cleared_keyspace_id_is_not_recycled_while_journalled() -> fjall::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    let cleared_id = {
+        let db = Database::builder(&folder).open()?;
+        let a = db.keyspace("a", KeyspaceCreateOptions::default)?;
+        a.insert("k", "v")?;
+        let b = db.keyspace("b", KeyspaceCreateOptions::default)?;
+        let id = b.id();
+        b.clear()?; // journalled as "clear keyspace <id>"
+        db.delete_keyspace(b)?;
+        id
+    };
+
+    {
+        let db = Database::builder(&folder).open()?;
+        let c = db.keyspace("c", KeyspaceCreateOptions::default)?;
+        assert_ne!(cleared_id, c.id());
+
+        // Ingested data is not journalled, so a replayed clear would wipe it
+        let mut ingestion = c.start_ingestion()?;
+        for key in ["x", "y", "z"] {
+            ingestion.write(key, "ingested")?;
+        }
+        ingestion.finish()?;
+        assert_eq!(3, c.len()?);
+    }
+
+    let db = Database::builder(&folder).open()?;
+    let c = db.keyspace("c", KeyspaceCreateOptions::default)?;
+    assert_eq!(3, c.len()?);
+
+    Ok(())
+}

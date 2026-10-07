@@ -748,6 +748,9 @@ impl Database {
                     }
 
                     for keyspace_id in &batch.cleared_keyspaces {
+                        highest_encountered_keyspace_id =
+                            highest_encountered_keyspace_id.max(*keyspace_id);
+
                         let Some(keyspace_name) = db.meta_keyspace.resolve_id(*keyspace_id)? else {
                             continue;
                         };
