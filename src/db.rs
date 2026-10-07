@@ -73,7 +73,9 @@ impl Drop for DatabaseInner {
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
         {
-            let _ = self.worker_pool.sender.send(WorkerMessage::Close);
+            // Never block: once the workers are gone nothing drains the bounded
+            // channel, and a full queue would hang the drop forever.
+            let _ = self.worker_pool.sender.try_send(WorkerMessage::Close);
             std::thread::sleep(std::time::Duration::from_micros(10));
         }
 
@@ -360,6 +362,15 @@ impl Database {
         })?;
 
         Ok(())
+    }
+
+    /// Returns `true` once the database is poisoned, see [`crate::Error::Poisoned`].
+    ///
+    /// A poisoned database refuses all further writes; the only way out is to
+    /// drop every handle to it and open it again.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.is_poisoned.is_poisoned()
     }
 
     #[doc(hidden)]
